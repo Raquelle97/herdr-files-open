@@ -7,7 +7,7 @@
 // Files the editor can't preview (html, pdf, images, office, archives) open with the
 // system default app instead — locally at once, or after downloading from that machine.
 import { View, div, svg, image } from "gpui-kit";
-import { v_flex, h_flex, Editor, EditorState, TextView } from "gpui-base";
+import { v_flex, h_flex, Editor, EditorState, TextView, Input, InputState } from "gpui-base";
 import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, home, appHome, notify,
   props, openOverlay, closeOverlay, pickFolder, setShared, shared } from "herdr";
 
@@ -85,6 +85,35 @@ async function launchWith(local) {
   else await launch(local);
 }
 
+// Show a download where it landed: Explorer and Finder can select the file itself,
+// the others only open the folder. Failures are silent — the file is already saved.
+async function showInFileManager(local) {
+  try {
+    if (platform() === "windows") await exec("explorer.exe", [`/select,${winpath(local)}`]);
+    else if (platform() === "macos") await exec("open", ["-R", local]);
+    else await exec("xdg-open", [String(local).replace(/[\\/][^\\/]*$/, "") || "/"]);
+  } catch {}
+}
+
+// A path as typed in the header box: `~`, a relative name, or an absolute path with
+// either separator. `..` is folded here so the tree never shows a `../..` root.
+function resolvePath(text, root) {
+  const raw = String(text ?? "").trim().replace(/^["'](.*)["']$/, "$1");
+  if (!raw) return null;
+  let p = raw.replace(/\\/g, "/");
+  if (p === "~") p = home();
+  else if (p.startsWith("~/")) p = `${home()}/${p.slice(2)}`;
+  else if (!/^([A-Za-z]:)?\//.test(p)) p = `${String(root ?? "").replace(/[\\/]+$/, "")}/${p}`;
+  const drive = /^[A-Za-z]:/.exec(p)?.[0] ?? "";
+  const parts = [];
+  for (const seg of p.replace(drive, "").split("/")) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") parts.pop();
+    else parts.push(seg);
+  }
+  return `${drive}/${parts.join("/")}` || "/";
+}
+
 // Where downloads land: `mods/files-open/config.json`
 // {"downloadDir": "D:/Downloads"} — any absolute folder. Unset means the OS
 // Downloads folder; `cacheDir` is the older name for the same setting and still
@@ -94,6 +123,11 @@ const CONFIG_FILE = `${appHome()}/mods/files-open/config.json`;
 const trimDir = (p) => String(p).trim().replace(/[\\/]+$/, "");
 async function readConfig() {
   try { return JSON.parse((await readTextFile(CONFIG_FILE)) ?? "{}") ?? {}; } catch { return {}; }
+}
+// `{"reveal": false}` in the same file keeps the file manager closed after a download.
+async function revealWanted() {
+  const cfg = await readConfig();
+  return cfg?.reveal !== false && cfg?.revealAfterDownload !== false;
 }
 async function saveDir() {
   const cfg = await readConfig();
@@ -277,6 +311,9 @@ function location() {
 const key = () => JSON.stringify(location());
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html", md: "markdown" };
 const PER_FOLDER = 500, TOTAL = 5000;
+// Folders first, then by name — the order a jump and a refresh both use.
+const sortEntries = (entries) =>
+  entries.slice().sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name));
 
 async function directory(path, on) {
   const windowsDirectory = async () => {
@@ -309,6 +346,11 @@ export default class Files extends View {
     if (props()?.fileMenu) return;
     this.saved = new Map();
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
+    // The header path doubles as an address bar: click it, type, Enter.
+    this.editing = false;
+    this.input = InputState.new({ placeholder: "path — Enter to go, empty Enter to cancel" });
+    this.input.on("submit", (_e, cx) => this.jumpTo(this.input.value(), cx));
+    this.input.on("blur", (_e, cx) => { if (this.editing) { this.editing = false; cx.notify(); } });
     this.refresh(cx);
     cx.timer.every(10000, cx => this.refresh(cx));
     // A popup cannot outlive its own press, so the menu only records what was
@@ -335,7 +377,7 @@ export default class Files extends View {
     const entries = await directory(path ? `${root}/${path}` : root, on);
     if (!this.current(context) || (path && !this.folders.has(path))) return;
     const used = [...this.entries.entries()].filter(([p]) => p !== path).reduce((n, [, e]) => n + e.length, 0);
-    this.entries.set(path, entries.slice(0, Math.max(0, Math.min(PER_FOLDER, TOTAL - used))).sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name)));
+    this.entries.set(path, sortEntries(entries.slice(0, Math.max(0, Math.min(PER_FOLDER, TOTAL - used)))));
     if (entries.length > PER_FOLDER || used + entries.length > TOTAL) this.limited = true;
   }
 
@@ -344,7 +386,8 @@ export default class Files extends View {
     if (next !== this.context?.key) {
       if (this.context) this.saved.set(this.context.key, { folders: this.folders, file: this.file });
       const saved = this.saved.get(next);
-      this.context = { key: next, cwd, on }; this.root = cwd; this.on = on; this.entries = new Map(); this.folders = new Set(saved?.folders);
+      this.context = { key: next, cwd, on }; this.root = cwd; this.on = on; this.baseCwd = cwd;
+      this.entries = new Map(); this.folders = new Set(saved?.folders);
       this.pending = new Set(); this.marks = {}; this.copied = null; this.copiedRow = null; this.show(null); this.watched = null; this.error = null; this.limited = false;
       this.selected = null; this.selectedDir = null; this.status = null; this.hint = null; this.failed = false;
       this.loading = false;
@@ -363,7 +406,7 @@ export default class Files extends View {
       } catch (e) { if (this.current(context)) this.error = String(e); }
       finally { if (this.context === context) this.loading = false; cx.notify(); }
     });
-    this.watch(cwd, cx);
+    this.watch(this.root ?? cwd, cx);
   }
 
   toggle(path, cx) {
@@ -380,6 +423,72 @@ export default class Files extends View {
       });
     }
     cx.notify();
+  }
+
+  // The header path is also an address bar. A folder moves the tree there; a path to a
+  // file moves to its folder and previews it, since that is what a pasted path means.
+  beginJump(cx) {
+    this.input.set_value(this.file ? `${this.root}/${this.file}` : this.root ?? "");
+    this.editing = true;
+    this.input.focus();
+    cx.notify();
+  }
+
+  jumpTo(text, cx) {
+    const target = resolvePath(text, this.root);
+    this.editing = false;
+    if (!target || target === this.root) { cx.notify(); return; }
+    const context = this.context, on = this.on;
+    const land = (root, file, entries) => {
+      this.context = { ...context, cwd: root };
+      this.root = root;
+      this.folders = new Set(); this.pending = new Set(); this.marks = {};
+      this.selected = null; this.selectedDir = null;
+      this.entries = new Map([["", sortEntries(entries.slice(0, PER_FOLDER))]]);
+      this.watched = null; this.error = null; this.status = null;
+      this.limited = entries.length > PER_FOLDER;
+      this.show(file ?? null, cx);
+      this.watch(root, cx);
+    };
+    this.status = null;
+    cx.spawn(async cx => {
+      try {
+        const entries = await directory(target, on);
+        if (!this.current(context)) return;
+        land(target, null, entries);
+      } catch {
+        const cut = target.replace(/[\\/][^\\/]*$/, "");
+        const name = target.split("/").pop();
+        let entries = null;
+        if (cut && cut !== target) { try { entries = await directory(cut, on); } catch {} }
+        if (!this.current(context)) return;
+        if (entries?.some(x => !x.dir && x.name === name)) land(cut, name, entries);
+        else this.status = `Not a folder: ${target}`;
+      } finally { cx.notify(); }
+    });
+  }
+
+  // `name` while the tree sits on the pane's own folder, `…/name` once it has been
+  // moved somewhere else — enough to tell a jump happened without reading the path.
+  rootLabel() {
+    const root = this.root ?? "", name = base(root) || root || "/";
+    return this.baseCwd && root && root !== this.baseCwd ? `…/${name}` : name;
+  }
+
+  pathLine(t, cx) {
+    if (this.editing) {
+      return Input.new(this.input).flex_1().min_w(0).h(24).px(6).rounded(6).border_1()
+        .border_color(t.accent).bg(t.background).text_size(12).text_color(t.foreground);
+    }
+    const label = this.copied
+      ? `✓ ${this.copied.split(/[\\/]/).pop() || this.copied}`
+      : this.file ?? this.rootLabel();
+    return div().id("files-path").flex_1().min_w(0).truncate().text_right().text_size(12)
+      .text_color(this.copied ? t.ansi2 : t.dim).cursor_pointer()
+      .hover(s => s.text_color(t.foreground))
+      .on_click((_e, cx) => this.beginJump(cx))
+      .on_mouse_down("right", (_e, cx) => this.copyPath(this.file ?? "", cx))
+      .child(label);
   }
 
   // Hand the file to the OS: local paths straight away, remote ones after an scp.
@@ -435,6 +544,9 @@ export default class Files extends View {
         if (choose) await rememberSaveDir(dir);
         if (this.current(context)) this.status = `Saved to ${saved}`;
         notify({ title: "Downloaded", body: saved, level: "success", timeout: 2400 });
+        // Show where it landed — Explorer/Finder with the file selected. Not awaited:
+        // the file is saved either way, and the bar shouldn't wait on a window.
+        if (await revealWanted()) showInFileManager(saved);
       } catch (e) {
         if (this.current(context)) this.status = `Download failed: ${String(e).split("\n")[0].slice(0, 160)}`;
       } finally {
@@ -662,10 +774,10 @@ export default class Files extends View {
         .when(Boolean(this.file), el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => { this.show(null); cx.notify(); }).child("←")))
         .when(Boolean(this.file), el => el.child(image(iconSvg(iconOf(this.file))).w(15).h(15).flex_none()))
         .child(div().font_semibold().child("Files"))
-        .child(div().flex_1().min_w(0).truncate().text_right().text_size(12)
-          .text_color(this.copied ? t.ansi2 : t.dim).cursor_pointer()
-          .on_mouse_down("right", (_e, cx) => this.copyPath(this.file ?? "", cx))
-          .child(this.copied ? `✓ ${this.copied.split(/[\\/]/).pop() || this.copied}` : this.file ?? this.root?.split(/[\\/]/).pop() ?? ""))
+        .when(Boolean(this.baseCwd) && this.root !== this.baseCwd, el => el.child(div().id("files-home").px(3).cursor_pointer()
+          .text_color(t.muted).hover(s => s.text_color(t.foreground))
+          .on_click((_e, cx) => this.jumpTo(this.baseCwd, cx)).child("↩")))
+        .child(this.pathLine(t, cx))
         .when(!this.file, el => el.child(div().id("files-upload").px(3).cursor_pointer().text_color(t.muted).hover(s => s.text_color(t.foreground))
           .on_click((_e, cx) => this.startUpload(cx)).child(svg("mods/files-open/upload-arrow.svg").size(15))))
         .when(Boolean(this.file), el => el.child(div().id("files-open-ext").px(6).cursor_pointer().text_color(t.muted).hover(s => s.text_color(t.foreground))

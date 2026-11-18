@@ -34,6 +34,10 @@ yourself — a block whose content is `{ "mod": "files-open" }`.
 
 - click a folder to expand it, again to close
 - click a text file to preview it in the panel; markdown renders as markdown
+- **click the path in the header** and it turns into a box: type an absolute path, `~`, or
+  a name relative to the folder on screen, then Enter. A path to a file opens its folder
+  with that file previewed. While the tree sits somewhere else the header reads `…/name`
+  and a `↩` next to `Files` takes it back to the pane's own folder
 - click a pdf, image, docx, zip… to just select it — it needs a double-click or the menu
 - **double-click** any file to open it in the OS default app
 - **right-click** a row: Preview, Open with default app, Open with…, Download,
@@ -47,19 +51,22 @@ yourself — a block whose content is `{ "mod": "files-open" }`.
   arrived ("Downloading data · 5.6 MB of 22.4 MB"), or a sliding highlight while the size
   is still unknown; uploads count items
 - uploads and downloads never overwrite: a clash becomes `name (1).ext`
+- a finished download opens Explorer/Finder on the file that just landed (`"reveal": false`
+  turns that off)
 
 ## Config
 
 `mods/files-open/config.json` is read on every download, so an edit applies at once:
 
 ```json
-{ "downloadDir": "D:/Downloads" }
+{ "downloadDir": "D:/Downloads", "reveal": false }
 ```
 
 That is where a remote file lands before the OS opens it, and where `Download` puts a copy
 (default `~/Downloads`; `cacheDir` is the older name for the same setting). A local file
 opens in place — nothing is copied unless you ask for it. `Download to…` saves wherever you
-pick and remembers that folder for next time.
+pick and remembers that folder for next time. `reveal` (default `true`) is whether a
+finished download opens the file manager on the file.
 
 ## Limits
 

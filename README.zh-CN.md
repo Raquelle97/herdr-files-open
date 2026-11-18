@@ -32,6 +32,9 @@ Herdr 第一次看到该目录时会把它停靠在右侧（`mod.json` 里写着
 
 - 点文件夹展开，再点收起
 - 点文本文件在面板里预览；markdown 按 markdown 渲染
+- **点标题栏里的路径**，它会变成一个输入框：绝对路径、`~`、或相对当前目录的名字，
+  回车即跳转。输入的是文件路径时，跳到它所在目录并预览该文件。跳走之后标题栏显示
+  `…/名字`，`Files` 旁边的 `↩` 一键回到终端自己的目录
 - 点 pdf、图片、docx、压缩包……只是选中它——打开需要双击或走右键菜单
 - **双击**任意文件，用系统默认程序打开
 - **右键**某一行：Preview、Open with default app、Open with…、Download、Download to…、
@@ -43,18 +46,20 @@ Herdr 第一次看到该目录时会把它停靠在右侧（`mod.json` 里写着
 - 复制过程中，标题栏下方会出现进度条：按落地目录已经到达的字节填充
   （`Downloading data · 5.6 MB of 22.4 MB`）；大小还算不出来时是一段滑动的高亮。上传按条目计数
 - 上传和下载都不覆盖：撞名会变成 `name (1).ext`
+- 下载完成后会在资源管理器 / Finder 里弹出刚落地的那个文件（`"reveal": false` 可关掉）
 
 ## 配置
 
 每次下载都会读 `mods/files-open/config.json`，改完立即生效：
 
 ```json
-{ "downloadDir": "D:/Downloads" }
+{ "downloadDir": "D:/Downloads", "reveal": false }
 ```
 
 这既是远程文件交给系统程序打开前的中转位置，也是 `Download` 复制到的位置
 （默认 `~/Downloads`；`cacheDir` 是同一设置的旧名字）。本地文件就地打开——你不要求就不会复制。
-`Download to…` 存到你挑选的目录，并记住这个选择供下次使用。
+`Download to…` 存到你挑选的目录，并记住这个选择供下次使用。`reveal`（默认 `true`）
+决定下载完成后是否弹出文件管理器并选中该文件。
 
 ## 限制
 

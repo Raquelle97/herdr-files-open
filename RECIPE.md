@@ -14,11 +14,13 @@ One panel, 360 px wide by default, docked at the right of the window. A rounded 
 
 - **Header**, 42 px, 14 px side padding, 8 px gaps, border beneath. Left to right: `←`
   (only while a file is previewed, 20 px, `muted`, goes back to the tree), the previewed
-  file's 15 px colour icon (same condition), the word `Files` in semibold, then pushed
-  right a single line in 12 px `dim` — the previewed file's path, or the folder's name —
-  which truncates with an ellipsis and is the same hit target for right-click copy. When
-  a file is previewed, `↗` (6 px padding, `muted`, `foreground` on hover) opens it in the
-  OS app.
+  file's 15 px colour icon (same condition), the word `Files` in semibold, `↩` once the
+  tree has been jumped away from the pane's own folder, then pushed right a single line in
+  12 px `dim` — the previewed file's path, or the folder's name (`…/name` after a jump) —
+  which truncates with an ellipsis and is the same hit target for right-click copy. Click
+  that line and it becomes an `Input` (24 px, 6 px radius, 1 px `accent` border) holding the
+  full path; see the address bar below. When a file is previewed, `↗` (6 px padding,
+  `muted`, `foreground` on hover) opens it in the OS app.
 - **Tree**, 6 px padding, scrolling. Rows are 28 px tall, 7 px rounded, 8 px + 18 px per
   depth of left padding, 8 px right, 7 px gaps, `hover` background under the pointer.
   Each row: a 12 px chevron in `dim` for folders (down when open, right when closed) or a
@@ -55,6 +57,21 @@ Folders sort first, then files, both case-insensitively by name. `.git` is hidde
   another machine, into the config folder or a folder the picker returns; a name already
   taken becomes `name (1).ext` rather than being overwritten. A folder into its own
   subfolder is refused instead of recursing for ever.
+- A finished download calls `explorer.exe /select,<file>` (Windows), `open -R` (macOS) or
+  `xdg-open <folder>` (Linux) so the person sees where it landed — unless `config.json`
+  says `{"reveal": false}`. Not awaited: the file is saved either way.
+- **The address bar.** Clicking the path line sets `editing`, fills the `InputState` with
+  the full path (or the previewed file's), and focuses it; `submit` runs `jumpTo`, `blur`
+  drops back to the plain line. A typed path goes through `resolvePath`: `~` and `~/…`
+  become `home()`, a bare name is joined to the folder on screen, `\` becomes `/`, and
+  `..` is folded by hand — so a jump never shows a `../..` root. The target is then listed
+  with `directory()`; success moves the tree there, failure is retried against the target's
+  parent, and if the parent does list a file of that name the tree moves there and previews
+  it. Anything else says `Not a folder: <path>`.
+- A jump rewrites `this.context.cwd` as well as `this.root`: `loadFolder` reads the folder
+  out of its `context` argument, and the 10 s refresh keys off `location()`, which the jump
+  does not change — only the context edit makes the next reload land in the new folder.
+  `this.baseCwd` keeps the pane's own folder, which `↩` jumps back to.
 - Uploads and drag-and-drop copy the other way with the same no-overwrite rule.
 - A copy in flight owns a bar under the header. The free name is chosen first, then the
   source's size, then the destination is sampled every 700 ms — one `du` or PowerShell per
@@ -62,7 +79,7 @@ Folders sort first, then files, both case-insensitively by name. `.git` is hidde
   `transition("width", 240)`. No size (a failed measure, or a source that cannot be
   counted) leaves it indeterminate: a 96 px fill sliding on a native `loop("left")`.
   Uploads need no sampling: the item counter is the progress.
-- There is no focus or key handling: it is a pointer-only panel.
+- There is no key handling beyond the address bar's own `Input`: no focus, no shortcuts.
 
 ## Built from
 
@@ -74,7 +91,7 @@ standard library only).
 - `herdr`: `spaces`, `panes`, `focused`, `exec`, `readTextFile`, `watchFolder`, `theme`,
   `settings`, `window`, `home`, `appHome`, `notify`.
 - `gpui-kit`: `div`, `svg`, `image`, `View`; `gpui-base`: `v_flex`, `h_flex`, `Editor`,
-  `EditorState`.
+  `EditorState`, `TextView`, `Input`, `InputState`.
 - Listing: `sh -c` with a `printf` loop for a POSIX folder; PowerShell
   `Get-ChildItem -Force` for a Windows local folder; `exec(..., { on })` sends either to
   the pane's machine.
@@ -99,6 +116,12 @@ standard library only).
 - A symlinked folder keeps the directory attribute even when dangling, hence the
   reparse-point test before calling an entry a folder.
 - Hard caps: 500 entries per folder, 5 000 in the tree, depth 40, 400 KB per preview.
+- A panel block's `props` are visible to it (`props()`), which is how a jump was tested
+  without a mouse: `{"mod": "files-open", "props": {"probe": "/some/path"}}` in the layout,
+  a one-shot timer in `init`, then `layout.switch` to rebuild the panel. The probe is gone
+  from the shipped file.
+- `explorer.exe /select,` exits non-zero even when it works, so the reveal is wrapped in a
+  `try {} catch {}` like the other launchers.
 
 ## Done when
 
