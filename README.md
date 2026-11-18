@@ -15,6 +15,14 @@ cp -r /tmp/files-open/mods/files-open ~/.config/herdr-app/mods/
 herdr-app check ~/.config/herdr-app/mods/files-open    # -> check passed
 ```
 
+Windows (PowerShell):
+
+```powershell
+git clone https://github.com/Raquelle97/herdr-files-open "$env:TEMP\files-open"
+Copy-Item -Recurse "$env:TEMP\files-open\mods\files-open" "$env:USERPROFILE\.config\herdr-app\mods\"
+herdr-app check "$env:USERPROFILE\.config\herdr-app\mods\files-open"
+```
+
 Herdr docks it on the right the first time it sees the folder (`mod.json` says
 `{ "place": "right", "size": 360 }`). If you already have a layout, put it there
 yourself — a block whose content is `{ "mod": "files-open" }`.
