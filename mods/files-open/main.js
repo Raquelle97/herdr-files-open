@@ -95,14 +95,30 @@ async function showInFileManager(local) {
   } catch {}
 }
 
+// `home()` is this machine's home, and a pane can be on another one — so `~` there
+// means that machine's home, asked of it once and remembered.
+const homeCache = new Map();
+async function homeOf(on) {
+  if (!on) return home();
+  if (!homeCache.has(on)) {
+    let h = home();
+    try {
+      const r = await exec("sh", ["-c", 'printf %s "$HOME"'], { on });
+      if (r.code === 0 && r.stdout.trim()) h = r.stdout.trim();
+    } catch {}
+    homeCache.set(on, h);
+  }
+  return homeCache.get(on);
+}
+
 // A path as typed in the header box: `~`, a relative name, or an absolute path with
 // either separator. `..` is folded here so the tree never shows a `../..` root.
-function resolvePath(text, root) {
+function resolvePath(text, root, homeDir) {
   const raw = String(text ?? "").trim().replace(/^["'](.*)["']$/, "$1");
   if (!raw) return null;
   let p = raw.replace(/\\/g, "/");
-  if (p === "~") p = home();
-  else if (p.startsWith("~/")) p = `${home()}/${p.slice(2)}`;
+  if (p === "~") p = homeDir;
+  else if (p.startsWith("~/")) p = `${homeDir}/${p.slice(2)}`;
   else if (!/^([A-Za-z]:)?\//.test(p)) p = `${String(root ?? "").replace(/[\\/]+$/, "")}/${p}`;
   const drive = /^[A-Za-z]:/.exec(p)?.[0] ?? "";
   const parts = [];
@@ -435,9 +451,9 @@ export default class Files extends View {
   }
 
   jumpTo(text, cx) {
-    const target = resolvePath(text, this.root);
     this.editing = false;
-    if (!target || target === this.root) { cx.notify(); return; }
+    const raw = String(text ?? "").trim(), here = this.root;
+    if (!raw) { cx.notify(); return; }
     const context = this.context, on = this.on;
     const land = (root, file, entries) => {
       this.context = { ...context, cwd: root };
@@ -452,6 +468,8 @@ export default class Files extends View {
     };
     this.status = null;
     cx.spawn(async cx => {
+      const target = resolvePath(raw, here, await homeOf(on));
+      if (target === here) { cx.notify(); return; }
       try {
         const entries = await directory(target, on);
         if (!this.current(context)) return;
