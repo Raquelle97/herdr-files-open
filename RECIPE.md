@@ -56,6 +56,12 @@ Folders sort first, then files, both case-insensitively by name. `.git` is hidde
   taken becomes `name (1).ext` rather than being overwritten. A folder into its own
   subfolder is refused instead of recursing for ever.
 - Uploads and drag-and-drop copy the other way with the same no-overwrite rule.
+- A copy in flight owns a bar under the header. The free name is chosen first, then the
+  source's size, then the destination is sampled every 700 ms — one `du` or PowerShell per
+  sample, never per frame — and the fill is a div sized to `done / total` with
+  `transition("width", 240)`. No size (a failed measure, or a source that cannot be
+  counted) leaves it indeterminate: a 96 px fill sliding on a native `loop("left")`.
+  Uploads need no sampling: the item counter is the progress.
 - There is no focus or key handling: it is a pointer-only panel.
 
 ## Built from

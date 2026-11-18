@@ -41,6 +41,9 @@ yourself — a block whose content is `{ "mod": "files-open" }`.
   them into the folder on screen — over scp when the pane is on another machine
 - **drag files or folders onto the panel** to upload them; with a folder row selected they
   land inside that folder
+- a copy in flight draws a bar under the header — filled by how much of the destination has
+  arrived ("Downloading data · 5.6 MB of 22.4 MB"), or a sliding highlight while the size
+  is still unknown; uploads count items
 - uploads and downloads never overwrite: a clash becomes `name (1).ext`
 
 ## Config

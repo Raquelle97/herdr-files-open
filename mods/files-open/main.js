@@ -119,6 +119,44 @@ async function makeDir(dir) {
   } else await exec("mkdir", ["-p", dir]);
 }
 
+// A size for the progress line: 812 KB, 22.4 MB, 1.3 GB.
+const fmtBytes = (n) => {
+  const v = Number(n) || 0;
+  if (v >= 1e9) return `${(v / 1e9).toFixed(1)} GB`;
+  if (v >= 1e6) return `${(v / 1e6).toFixed(1)} MB`;
+  if (v >= 1e3) return `${Math.round(v / 1e3)} KB`;
+  return `${Math.round(v)} B`;
+};
+
+// How many bytes sit under `path` right now — the running destination of a copy, or
+// its source to know what 100% is. One process per answer, so the bar samples it at
+// a slow beat rather than every frame. Negative means "cannot tell": no bar, just a
+// moving highlight.
+async function bytesUnder(path, on = null) {
+  try {
+    if (on) {
+      const r = await exec("ssh", [on, `du -sk '${String(path).replace(/'/g, "'\\''")}' 2>/dev/null || echo 0`]);
+      const kb = parseInt((r.stdout || "").trim(), 10);
+      return Number.isFinite(kb) ? kb * 1024 : -1;
+    }
+    if (platform() === "windows") {
+      const q = String(winpath(path)).replace(/'/g, "''");
+      const ps = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $p='" + q + "'; "
+        + "if (-not (Test-Path -LiteralPath $p)) { 0 } "
+        + "elseif (Test-Path -LiteralPath $p -PathType Container) { $s=[long]0; "
+        + "foreach ($f in [IO.DirectoryInfo]::new($p).EnumerateFiles('*', [IO.SearchOption]::AllDirectories)) { $s += $f.Length }; $s } "
+        + "else { (Get-Item -LiteralPath $p).Length }";
+      const r = await exec("powershell", ["-NoProfile", "-Command", ps]);
+      const n = parseInt((r.stdout || "").trim(), 10);
+      return Number.isFinite(n) ? n : -1;
+    }
+    const r = await exec("du", ["-sk", path]);
+    const kb = parseInt((r.stdout || "").trim().split(/\s+/)[0], 10);
+    return Number.isFinite(kb) ? kb * 1024 : -1;
+  } catch { return -1; }
+}
+
+
 // Pull a remote file into the local download folder so the OS can open it.
 async function fetchHere(machine, remote, name) {
   const dir = await saveDir();
@@ -151,34 +189,33 @@ async function freeName(dir, name) {
 }
 
 // Copy a local file or folder into `dir`, never overwriting; returns where it landed.
-// Powershell rather than `cmd /c copy`: a destination with a space or a bracket in
-// it makes cmd re-read its own quotes and copy nothing.
-async function copyInto(src, dir) {
+// `dest` is where it should land, when the caller already picked the free name so a
+// progress bar can watch that path while the copy runs. Powershell rather than
+// `cmd /c copy`: a destination with a space or a bracket in it makes cmd re-read its
+// own quotes and copy nothing.
+async function copyInto(src, dir, dest) {
+  const to = dest ?? await freeName(dir, base(src));
   if (platform() === "windows") {
     const q = (s) => String(s).replace(/'/g, "''");
-    const ps = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); & { param($s, $d) "
-      + "if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null } "
-      + "$b = [IO.Path]::GetFileNameWithoutExtension($s); $e = [IO.Path]::GetExtension($s); "
-      + "$t = Join-Path $d ([IO.Path]::GetFileName($s)); "
-      + "for ($i = 1; Test-Path -LiteralPath $t; $i++) { $t = Join-Path $d ('{0} ({1}){2}' -f $b, $i, $e) } "
+    const ps = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); & { param($s, $t) "
+      + "$p = Split-Path -Parent $t; "
+      + "if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null } "
       + "Copy-Item -LiteralPath $s -Destination $t -Force -Recurse; $t } '"
-      + q(winpath(src)) + "' '" + q(winpath(dir)) + "'";
+      + q(winpath(src)) + "' '" + q(winpath(to)) + "'";
     const r = await exec("powershell", ["-NoProfile", "-Command", ps]);
-    return (r.stdout || "").trim() || `${winpath(dir)}\\${base(src)}`;
+    return (r.stdout || "").trim() || winpath(to);
   }
-  const script = 'mkdir -p "$2"; s="$1"; d="$2"; n=${s##*/}; t="$d/$n"; b=${n%.*}; e=${n##*.}; '
-    + 'e=$([ "$e" = "$n" ] && echo "" || echo ".$e"); i=1; '
-    + 'while [ -e "$t" ]; do t="$d/$b ($i)$e"; i=$((i+1)); done; cp -Rp "$s" "$t"; printf %s "$t"';
-  const r = await exec("sh", ["-c", script, "cp", src, dir]);
-  return (r.stdout || "").trim() || `${dir}/${base(src)}`;
+  const script = 'd=${2%/*}; [ -d "$d" ] || mkdir -p "$d"; cp -Rp "$1" "$2"; printf %s "$2"';
+  const r = await exec("sh", ["-c", script, "cp", src, to]);
+  return (r.stdout || "").trim() || to;
 }
 
 // scp a remote file or folder down to `dir`, never overwriting; returns the local path.
-async function pullInto(machine, remote, dir) {
-  const dest = await freeName(dir, base(remote));
+async function pullInto(machine, remote, dir, dest) {
+  const to = dest ?? await freeName(dir, base(remote));
   await makeDir(dir);
-  await exec("scp", ["-q", "-B", "-r", `${machine}:${remote}`, dest]);
-  return dest;
+  await exec("scp", ["-q", "-B", "-r", `${machine}:${remote}`, to]);
+  return to;
 }
 
 // scp a local file or folder up into a folder on `machine`, also without overwriting.
@@ -368,30 +405,73 @@ export default class Files extends View {
   }
 
   // Save a copy: straight into the download folder, or wherever the person picks.
+  // The bar under the header follows the destination's size, sampled on a slow beat
+  // (one `du` or PowerShell per sample, not per frame) and stopped with the copy.
   download(path, cx, choose = false) {
-    const context = this.context;
+    const context = this.context, name = base(path), on = this.on;
     cx.spawn(async cx => {
-      const dir = choose ? await pickFolder({ prompt: `Download ${base(path)} to…` }) : await saveDir();
+      const dir = choose ? await pickFolder({ prompt: `Download ${name} to…` }) : await saveDir();
       if (!dir) return;
       const full = `${this.root}/${path}`;
       // Copying a folder into itself would recurse forever; say so instead.
-      if (!this.on) {
+      if (!on) {
         const norm = (s) => String(s).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
         const src = norm(winpath(full)), dst = norm(winpath(dir));
         if (dst === src || dst.startsWith(src + "/")) {
-          this.status = `Pick a folder outside ${base(path)}`; cx.notify(); this.fade(cx); return;
+          this.status = `Pick a folder outside ${name}`; cx.notify(); this.fade(cx); return;
         }
       }
-      this.hint = `Copying to ${dir}…`; cx.notify();
+      this.status = null; this.hint = null; this.failed = false;
+      let job = this.job = { label: `Preparing ${name}…`, unit: "bytes", done: 0, total: 0 };
+      cx.notify();
       try {
-        const saved = this.on ? await pullInto(this.on, full, dir) : await copyInto(full, dir);
+        // One free name, chosen here so the sampler knows exactly what to watch.
+        const saved = await freeName(dir, name);
+        const size = await bytesUnder(full, on);
+        job = this.job = { label: `Downloading ${name}`, unit: "bytes", done: 0, total: size > 0 ? size : 0 };
+        const stop = this.sampleBytes(saved, job, cx);
+        try { await (on ? pullInto(on, full, dir, saved) : copyInto(full, dir, saved)); }
+        finally { stop(); }
         if (choose) await rememberSaveDir(dir);
         if (this.current(context)) this.status = `Saved to ${saved}`;
         notify({ title: "Downloaded", body: saved, level: "success", timeout: 2400 });
       } catch (e) {
-        if (this.current(context)) this.status = `Download failed: ${String(e)}`;
-      } finally { this.hint = null; cx.notify(); this.fade(cx); }
+        if (this.current(context)) this.status = `Download failed: ${String(e).split("\n")[0].slice(0, 160)}`;
+      } finally {
+        // A second download started meanwhile owns the bar now; leave it alone.
+        if (this.job === job) this.job = null;
+        cx.notify(); this.fade(cx);
+      }
     });
+  }
+
+  // Watch a copy in flight: every beat, ask how big the destination has grown and move
+  // the bar. Returns the stop function; a stale job (or a failed sample) is ignored.
+  sampleBytes(dest, job, cx) {
+    const tick = async () => {
+      if (this.job !== job) return;
+      const n = await bytesUnder(dest);
+      if (this.job === job && n >= 0) { job.done = n; cx.notify(); }
+    };
+    const task = cx.timer.every(700, () => { tick(); });
+    return () => task.cancel();
+  }
+
+  // The bar itself: a filled groove once the size is known, a sliding highlight while
+  // it is not. Both animations run natively, so a render is only spent when a sample
+  // actually moves the number.
+  jobRow(t) {
+    const job = this.job, total = job.total > 0 ? job.total : 0;
+    const done = total ? Math.min(job.done, total) : job.done;
+    const pct = total ? Math.min(100, (done / total) * 100) : null;
+    const detail = total ? (job.unit === "items" ? `${done} of ${total}` : `${fmtBytes(done)} of ${fmtBytes(total)}`) : "";
+    const fill = pct === null
+      ? div().absolute().top(0).left(0).h_full().w(96).rounded_full().bg(t.ansi2)
+          .loop("left", { from: -96, to: 336, period: 1400, easing: "ease-in-out" })
+      : div().h_full().rounded_full().bg(t.ansi2).w(`${pct.toFixed(1)}%`).transition("width", { duration: 240, easing: "ease-out" });
+    return v_flex().flex_none().px(12).py(6).gap(5).border_b(1).border_color(t.border)
+      .child(div().text_size(11).text_color(t.dim).truncate().child(detail ? `${job.label} · ${detail}` : job.label))
+      .child(div().h(3).w_full().rounded_full().relative().overflow_hidden().bg(t.border).child(fill));
   }
 
   // Files from outside (a drop, or the system picker) land in the folder on screen.
@@ -402,7 +482,8 @@ export default class Files extends View {
     const localDir = into ? `${root}/${into}` : root;
     const where = into || base(root) || root;
     const total = paths.length;
-    this.hint = `Uploading ${total} item${total > 1 ? "s" : ""} to ${where}…`;
+    // Item by item is free to count, so uploads get a bar without sampling anything.
+    this.job = { label: `Uploading to ${where}`, unit: "items", done: 0, total };
     this.failed = false;
     cx.notify();
     cx.spawn(async cx => {
@@ -412,7 +493,8 @@ export default class Files extends View {
           if (on) await pushUp(on, p, remoteDir);
           else await copyInto(p, localDir);
           done.push(base(p));
-          if (this.current(context)) { this.hint = `Uploading ${done.length}/${total}…`; cx.notify(); }
+          if (this.job) this.job.done = done.length;
+          if (this.current(context)) cx.notify();
         }
         if (this.current(context)) {
           this.failed = false;
@@ -426,7 +508,7 @@ export default class Files extends View {
           this.status = `Upload failed after ${done.length}/${total}: ${why}`;
         }
       } finally {
-        this.hint = null;
+        this.hint = null; this.job = null;
         if (this.current(context)) this.refresh(cx);
         cx.notify(); this.fade(cx);
       }
@@ -590,6 +672,7 @@ export default class Files extends View {
           .on_click((_e, cx) => this.handOff(this.file, cx)).child("↗"))))
       .when(Boolean(this.status || this.hint), el => el.child(div().px(12).py(5).flex_none().border_b(1).border_color(t.border).text_size(11)
         .text_color(this.failed ? t.ansi1 : t.dim).truncate().child(this.status || this.hint)))
+      .when(Boolean(this.job), el => el.child(this.jobRow(t)))
       .when(!this.file, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.rows("", 0, [], t))
         .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))))
         .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total")))))
