@@ -1,0 +1,85 @@
+# Files Open
+
+[English](README.md) | 简体中文
+
+一个 Herdr 面板：把当前聚焦终端所在目录的文件树摆在侧边，每种文件类型配一个有颜色的图标。
+文本文件就地预览；编辑器显示不了的东西（html、pdf、图片、office、压缩包）交给系统默认程序打开——
+本地目录立刻打开，终端在远程机器上则先拉下来再打开。文件既能用按钮上传，也能直接拖进面板；
+下载也是同一套路，而且从不覆盖已有的同名文件。
+
+![Files Open](preview.png)
+
+## 安装
+
+```sh
+git clone https://github.com/Raquelle97/herdr-files-open /tmp/files-open
+cp -r /tmp/files-open/mods/files-open ~/.config/herdr-app/mods/
+herdr-app check ~/.config/herdr-app/mods/files-open    # -> check passed
+```
+
+Windows（PowerShell）：
+
+```powershell
+git clone https://github.com/Raquelle97/herdr-files-open "$env:TEMP\files-open"
+Copy-Item -Recurse "$env:TEMP\files-open\mods\files-open" "$env:USERPROFILE\.config\herdr-app\mods\"
+herdr-app check "$env:USERPROFILE\.config\herdr-app\mods\files-open"
+```
+
+Herdr 第一次看到该目录时会把它停靠在右侧（`mod.json` 里写着 `{ "place": "right", "size": 360 }`）。
+如果你已经有自己的布局，就手动加一块，内容为 `{ "mod": "files-open" }`。
+
+## 使用
+
+- 点文件夹展开，再点收起
+- 点文本文件在面板里预览；markdown 按 markdown 渲染
+- 点 pdf、图片、docx、压缩包……只是选中它——打开需要双击或走右键菜单
+- **双击**任意文件，用系统默认程序打开
+- **右键**某一行：Preview、Open with default app、Open with…、Download、Download to…、
+  Copy path（文件夹则是：Download folder、Download folder to…、Upload files here…、Copy path）——
+  文件夹会整体下载，包含所有子目录
+- **标题栏的 `⤒`** 或 `Upload files here…`：从本机挑文件，复制到面板当前显示的目录里；
+  终端在远程机器上时走 scp
+- **把文件或文件夹拖到面板上**即上传；若某一行文件夹是选中的，就落进那个文件夹
+- 复制过程中，标题栏下方会出现进度条：按落地目录已经到达的字节填充
+  （`Downloading data · 5.6 MB of 22.4 MB`）；大小还算不出来时是一段滑动的高亮。上传按条目计数
+- 上传和下载都不覆盖：撞名会变成 `name (1).ext`
+
+## 配置
+
+每次下载都会读 `mods/files-open/config.json`，改完立即生效：
+
+```json
+{ "downloadDir": "D:/Downloads" }
+```
+
+这既是远程文件交给系统程序打开前的中转位置，也是 `Download` 复制到的位置
+（默认 `~/Downloads`；`cacheDir` 是同一设置的旧名字）。本地文件就地打开——你不要求就不会复制。
+`Download to…` 存到你挑选的目录，并记住这个选择供下次使用。
+
+## 限制
+
+- 它只负责列出、预览、打开、上传和下载副本；不改名、不删除
+- 每个文件夹 500 项，整棵树 5 000 项，单次预览 400 KB
+- 远程预览通过该机器的通道读取文件；超长文件会被截断
+- 二进制文件只标注类型，不做解码
+- 拖拽必须落在面板本身；落在别处是 Herdr 自己的拖放
+
+## 图标
+
+`mods/files-open/ftypes/*.svg`——21 个文件家族，外加打开/关闭两种文件夹。它们是全彩 SVG，
+用 `image()` 加载；换成 `svg()` 会被当成主题色遮罩，颜色全被抹平。想映射更多扩展名，
+在 `main.js` 里扩 `EXT_ICON`（按扩展名）或 `NAME_ICON`（按文件名）；改了配色后
+用 `gen_file_icons.py` 重新生成整套。
+
+| | | | |
+|---|---|---|---|
+| `</>` js / ts / py / code | browser html / css / vue | `{}` json / yaml / toml | `M↓` markdown |
+| `>_` sh / bash / ps1 | cylinder sql / db | page pdf | page doc |
+| grid xls / csv / tsv | screen ppt | mountain png / jpg | note mp3 / wav |
+| play mp4 / mov | box zip / tar | blocks exe / so | lock .env / .pem |
+| branch .gitignore | page txt / log | folder / folder open | |
+
+## 许可
+
+Apache-2.0，见 [LICENSE](LICENSE)。本项目派生自 Herdr 自带的 `files` mod（Apache-2.0）；
+折叠箭头来自 Lucide 图标（ISC）。

@@ -1,5 +1,7 @@
 # Files Open
 
+English | [简体中文](README.zh-CN.md)
+
 A Herdr panel: the file tree of the folder the focused pane is in, with a colour icon
 per file type. Text files preview in place. Anything the editor can't show (html, pdf,
 images, office, archives) opens in your OS default app — at once for a local folder, or
