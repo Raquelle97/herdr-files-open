@@ -51,8 +51,8 @@ yourself — a block whose content is `{ "mod": "files-open" }`.
   arrived ("Downloading data · 5.6 MB of 22.4 MB"), or a sliding highlight while the size
   is still unknown; uploads count items
 - uploads and downloads never overwrite: a clash becomes `name (1).ext`
-- a finished download opens Explorer/Finder on the file that just landed (`"reveal": false`
-  turns that off)
+- a finished download opens the folder it landed in (Finder selects the file itself;
+  `"reveal": false` turns this off)
 
 ## Config
 
@@ -66,7 +66,7 @@ That is where a remote file lands before the OS opens it, and where `Download` p
 (default `~/Downloads`; `cacheDir` is the older name for the same setting). A local file
 opens in place — nothing is copied unless you ask for it. `Download to…` saves wherever you
 pick and remembers that folder for next time. `reveal` (default `true`) is whether a
-finished download opens the file manager on the file.
+finished download opens the folder in the file manager.
 
 ## Limits
 

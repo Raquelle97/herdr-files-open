@@ -57,9 +57,19 @@ Folders sort first, then files, both case-insensitively by name. `.git` is hidde
   another machine, into the config folder or a folder the picker returns; a name already
   taken becomes `name (1).ext` rather than being overwritten. A folder into its own
   subfolder is refused instead of recursing for ever.
-- A finished download calls `explorer.exe /select,<file>` (Windows), `open -R` (macOS) or
-  `xdg-open <folder>` (Linux) so the person sees where it landed — unless `config.json`
-  says `{"reveal": false}`. Not awaited: the file is saved either way.
+- A finished download opens the folder it landed in — `explorer.exe <folder>` (Windows),
+  `open -R <file>` (macOS), `xdg-open <folder>` (Linux) — unless `config.json` says
+  `{"reveal": false}`. Not awaited: the file is saved either way.
+- **Why Windows opens the folder and not the file.** `/select,<path>` is Explorer's way to
+  highlight a file, but it needs the switch and the path on one command line. Handed over
+  through `exec` as one argv token (`["/select,C:\dir\f.txt"]`) Explorer rejects it and
+  falls back to its *default* folder — Documents, or Desktop — so people got the wrong
+  window every time. Quoting the path inside the token, splitting it into
+  `["/select,", path]`, `cmd /c explorer.exe /select,"…"`, and
+  `Start-Process explorer.exe -ArgumentList '/select,"…"'` were all tried at runtime and all
+  failed the same way (the quotes don't survive `exec`'s argv round-trip into `cmd`). A plain
+  folder path is the only form that lands, and it is what the request was for anyway.
+  `open -R` on macOS has no such problem — its switch is `-R`, not a leading slash.
 - **The address bar.** Clicking the path line sets `editing`, fills the `InputState` with
   the full path (or the previewed file's), and focuses it; `submit` runs `jumpTo`, `blur`
   drops back to the plain line. A typed path goes through `resolvePath`: `~` and `~/…`
@@ -120,7 +130,7 @@ standard library only).
   without a mouse: `{"mod": "files-open", "props": {"probe": "/some/path"}}` in the layout,
   a one-shot timer in `init`, then `layout.switch` to rebuild the panel. The probe is gone
   from the shipped file.
-- `explorer.exe /select,` exits non-zero even when it works, so the reveal is wrapped in a
+- `explorer.exe` exits 1 even when the window opens, so the reveal is wrapped in a
   `try {} catch {}` like the other launchers.
 
 ## Done when

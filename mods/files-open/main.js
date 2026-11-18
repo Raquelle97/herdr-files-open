@@ -85,12 +85,17 @@ async function launchWith(local) {
   else await launch(local);
 }
 
-// Show a download where it landed: Explorer and Finder can select the file itself,
-// the others only open the folder. Failures are silent — the file is already saved.
+// Show a download where it landed. On Windows that is the containing folder only:
+// `/select,<path>` needs the switch and the path on one command line, and handed over
+// as a single argv token Explorer rejects it and falls back to its default folder —
+// Documents or Desktop, which is what people saw instead of the download. A plain
+// folder path is the one form that always lands. macOS can still select the file.
 async function showInFileManager(local) {
   try {
-    if (platform() === "windows") await exec("explorer.exe", [`/select,${winpath(local)}`]);
-    else if (platform() === "macos") await exec("open", ["-R", local]);
+    if (platform() === "windows") {
+      const p = winpath(local);
+      await exec("explorer.exe", [p.replace(/[\\/][^\\/]*$/, "") || p]);
+    } else if (platform() === "macos") await exec("open", ["-R", local]);
     else await exec("xdg-open", [String(local).replace(/[\\/][^\\/]*$/, "") || "/"]);
   } catch {}
 }
