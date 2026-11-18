@@ -1,9 +1,10 @@
 # Files Open
 
 A Herdr panel: the file tree of the folder the focused pane is in, with a colour icon
-per file type. Text files preview in place; anything the editor can't show (html, pdf,
+per file type. Text files preview in place. Anything the editor can't show (html, pdf,
 images, office, archives) opens in your OS default app — at once for a local folder, or
-after pulling it down when the pane is on a remote machine.
+after pulling it down when the pane is on a remote machine. Files go up by button or by
+drag and drop, and come down the same way, without ever overwriting what is there.
 
 ![Files Open](preview.png)
 
@@ -30,28 +31,37 @@ yourself — a block whose content is `{ "mod": "files-open" }`.
 ## Use
 
 - click a folder to expand it, again to close
-- click a text file to preview it in the panel
-- click a pdf, image, docx, zip… to open it in the OS default app
-- right-click any row, or the header, to copy its absolute path as that machine spells it
-- `↗` in the header opens the previewed file in the OS app, `←` goes back to the tree
+- click a text file to preview it in the panel; markdown renders as markdown
+- click a pdf, image, docx, zip… to just select it — it needs a double-click or the menu
+- **double-click** any file to open it in the OS default app
+- **right-click** a row: Preview, Open with default app, Open with…, Download,
+  Download to…, Copy path (folders: Upload files here…, Copy path)
+- **`⤒` in the header**, or `Upload files here…`, picks files from this computer and copies
+  them into the folder on screen — over scp when the pane is on another machine
+- **drag files or folders onto the panel** to upload them; with a folder row selected they
+  land inside that folder
+- uploads and downloads never overwrite: a clash becomes `name (1).ext`
 
 ## Config
 
 `mods/files-open/config.json` is read on every download, so an edit applies at once:
 
 ```json
-{ "cacheDir": "D:/herdr-open" }
+{ "downloadDir": "D:/Downloads" }
 ```
 
-Remote files land there and are then opened (default `~/herdr-open`). A local file opens
-in place — nothing is copied.
+That is where a remote file lands before the OS opens it, and where `Download` puts a copy
+(default `~/Downloads`; `cacheDir` is the older name for the same setting). A local file
+opens in place — nothing is copied unless you ask for it. `Download to…` saves wherever you
+pick and remembers that folder for next time.
 
 ## Limits
 
-- read-only: it lists, previews and opens, it does not rename, delete or save
+- it lists, previews, opens, uploads and downloads copies; it does not rename or delete
 - 500 entries per folder, 5 000 across the tree, 400 KB per preview
 - a remote preview reads the file over that machine's channel; long files are truncated
 - binary files are reported as such instead of decoded
+- a drop has to land on the panel itself; anywhere else it is Herdr's own drop
 
 ## Icons
 
