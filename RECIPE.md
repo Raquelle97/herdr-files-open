@@ -45,11 +45,18 @@ Folders sort first, then files, both case-insensitively by name. `.git` is hidde
   executables) hands it to the OS: `explorer.exe`, `open` or `xdg-open`. A local file is
   opened where it is; a remote one is first `scp`-ed to the cache folder (see below) — the
   header says so while it runs.
-- Right-click on a row, or on the header path, writes that path to the clipboard exactly
-  as that machine spells it (`\` for a Windows folder, `/` elsewhere) and shows `✓` where
-  the name was for 1.4 s.
-- Nothing here writes files, and there is no focus or key handling: it is a pointer-only
-  panel.
+- Right-click on a row opens this mod's own 236 px popup, one row per action: Preview,
+  Open with default app, Open with…, Download, Download to…, Copy path for a file;
+  Download folder, Download folder to…, Upload files here…, Copy path for a folder.
+- Copy path (in the popup, or right-clicking the path in the header) writes that path to
+  the clipboard exactly as that machine spells it (`\` for a Windows folder, `/` elsewhere)
+  and shows `✓` where the name was for 1.4 s.
+- A download is one `Copy-Item -Recurse` / `cp -Rp`, or one `scp -r` when the pane is on
+  another machine, into the config folder or a folder the picker returns; a name already
+  taken becomes `name (1).ext` rather than being overwritten. A folder into its own
+  subfolder is refused instead of recursing for ever.
+- Uploads and drag-and-drop copy the other way with the same no-overwrite rule.
+- There is no focus or key handling: it is a pointer-only panel.
 
 ## Built from
 

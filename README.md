@@ -35,7 +35,8 @@ yourself — a block whose content is `{ "mod": "files-open" }`.
 - click a pdf, image, docx, zip… to just select it — it needs a double-click or the menu
 - **double-click** any file to open it in the OS default app
 - **right-click** a row: Preview, Open with default app, Open with…, Download,
-  Download to…, Copy path (folders: Upload files here…, Copy path)
+  Download to…, Copy path (folders: Download folder, Download folder to…,
+  Upload files here…, Copy path) — a folder comes down whole, subfolders included
 - **`⤒` in the header**, or `Upload files here…`, picks files from this computer and copies
   them into the folder on screen — over scp when the pane is on another machine
 - **drag files or folders onto the panel** to upload them; with a folder row selected they

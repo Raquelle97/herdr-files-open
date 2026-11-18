@@ -373,9 +373,17 @@ export default class Files extends View {
     cx.spawn(async cx => {
       const dir = choose ? await pickFolder({ prompt: `Download ${base(path)} to…` }) : await saveDir();
       if (!dir) return;
+      const full = `${this.root}/${path}`;
+      // Copying a folder into itself would recurse forever; say so instead.
+      if (!this.on) {
+        const norm = (s) => String(s).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+        const src = norm(winpath(full)), dst = norm(winpath(dir));
+        if (dst === src || dst.startsWith(src + "/")) {
+          this.status = `Pick a folder outside ${base(path)}`; cx.notify(); this.fade(cx); return;
+        }
+      }
       this.hint = `Copying to ${dir}…`; cx.notify();
       try {
-        const full = `${this.root}/${path}`;
         const saved = this.on ? await pullInto(this.on, full, dir) : await copyInto(full, dir);
         if (choose) await rememberSaveDir(dir);
         if (this.current(context)) this.status = `Saved to ${saved}`;
@@ -456,8 +464,8 @@ export default class Files extends View {
       .when(!m.dir && !isExternal(m.path), el => el.child(item("preview", "Preview", "preview")))
       .when(!m.dir, el => el.child(item("open", "Open with default app", "open")))
       .when(!m.dir, el => el.child(item("openwith", platform() === "windows" ? "Open with…" : "Open in another app", "openwith")))
-      .when(!m.dir, el => el.child(item("download", "Download", "download")))
-      .when(!m.dir, el => el.child(item("downloadto", "Download to…", "downloadto")))
+      .child(item("download", m.dir ? "Download folder" : "Download", "download"))
+      .child(item("downloadto", m.dir ? "Download folder to…" : "Download to…", "downloadto"))
       .when(m.dir, el => el.child(item("upload", "Upload files here…", "upload")))
       .child(item("copy", "Copy path", "copy"));
   }
