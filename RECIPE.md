@@ -31,7 +31,7 @@ One panel, 360 px wide by default, docked at the right of the window. A rounded 
   their configured order at fixed 74 / 46 / 54 px. The column in force is `accent`-coloured
   and carries an 8 px `▲` (ascending) or `▼`. Clicking a label sorts by it, clicking it
   again reverses; right-clicking one opens the same columns menu. A value column can also be
-  dragged onto another: the one in hand goes to 45 % opacity, the one under the pointer gets
+  dragged onto another: the one in hand goes to 45 % opacity, the computed target gets
   a `hover` background and a 2 px `accent` bar on its leading edge, and the drop lands the
   column on the side it came from. The `⋮` is first because
   `Name` is the only cell that flexes — anywhere else and every column after it would shift
@@ -111,18 +111,23 @@ case-insensitively with digits as numbers (`file2` before `file10`); `.git` is h
   the tie-break stays ascending. `sortKey`/`sortDesc` live on the view, which is why a
   refresh (`loadFolder` → `sorted`) and a jump (`land` → `sorted`) keep the order. A layout
   can seed them with `props: {"sort": "date", "sortDesc": true}`.
-- **Columns drag.** A press on a value column's label sets `dragCol`, `on_mouse_move` on
-  each label records `overCol` (the element under the pointer is the target — no pointer
-  maths, no capture), and the release runs `dropCol`, which rebuilds `colOrder` with the
-  dragged key spliced in beside its target on the side it came from. `droppedAt` swallows
-  the click that the same release fires, so a drag never also sorts. A release anywhere
-  else in the card just clears both, which the root's `on_mouse_up` does.
+- **Columns drag.** A press on a value column's label sets `dragCol` and remembers the
+  pointer's window x as `dragX`. Move events bubble to the card root, which is the only
+  element that keeps hearing them once the pointer leaves the pressed label: GPUI stops
+  reporting hover over the cells the pointer passes during a drag, so a target cannot be
+  read from `overCol` on those cells. `dragIndexAt(x)` turns the travel from `dragX` into
+  an index by walking the fixed column widths plus the 7 px gaps, a half width at a time;
+  that index sets `overCol` and paints the target's `hover` background and accent bar.
+  The release runs `dropCol`, which rebuilds `colOrder` with the dragged key spliced in
+  beside its target on the side it came from. `droppedAt` swallows the click that the same
+  release fires, so a drag never also sorts. A release anywhere else in the card clears
+  the two states, which the root's `on_mouse_up` does.
 - **Update banner.** `checkUpdate` runs in `init`, reads `updates` from `config.json` and
   asks at most once per `intervalHours`, caching the answer in `state.json` (`latest`,
   `checkedAt`) so a restart neither re-asks nor forgets. `versionNewer` compares numeric
   parts, `localVersion()` reads `mod.json`'s `version` and falls back to the config's. A
-  newer version renders a 26 px strip under the header: `更新说明` opens the release page,
-  `稍后` writes `snoozeUntil` (+24 h), `✕` writes `dismissedVersion`; both are read back
+  newer version renders a 26 px strip under the header, in English: `What's new` opens the
+  release page, `Later` writes `snoozeUntil` (+24 h), `✕` writes `dismissedVersion`; both are read back
   before the banner is allowed to appear again.
 - **Double-click a folder walks in** (`enter` → `jumpTo` with a relative path, so it becomes
   the root); `↑` calls `goUp`, which asks `parentOf` for the parent, jumps there and passes
@@ -213,5 +218,5 @@ standard library only).
 11. Dragging the `Size` label onto `Modified` puts `Size` first, the accent bar shows where
     it will land, the drag does not also sort, and the new order survives a restart.
 12. With `updates.repo` (or `feed`) set to something newer than `mod.json`'s version, the
-    strip appears under the header; `稍后` hides it for a day and `✕` for that version,
+    strip appears under the header; `Later` hides it for a day and `✕` for that version,
     both across a restart, and with the keys empty no request is made at all.

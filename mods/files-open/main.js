@@ -577,6 +577,7 @@ export default class Files extends View {
     // the same release would otherwise read as "sort by this column".
     this.dragCol = null;
     this.overCol = null;
+    this.dragX = 0;
     this.droppedAt = 0;
     // The header path doubles as an address bar: click it, type, Enter.
     this.editing = false;
@@ -672,6 +673,21 @@ export default class Files extends View {
     this.colOrder = [...vis, ...this.colOrder.filter(k => this.colHidden.has(k))];
     this.saveCols();
     cx.notify();
+  }
+
+  // Where the dragged column would land. The pointer stops being reported over the
+  // column it was pressed on as soon as it leaves it, and the cells it passes are not
+  // hover targets during the drag, so hover tells nothing: the travel from the press
+  // point, measured against the widths it crosses, is the only honest input. The half
+  // width threshold means the column goes over only once its neighbour's centre is.
+  dragIndexAt(x) {
+    const vis = this.visibleCols(), from = vis.indexOf(this.dragCol);
+    if (from < 0) return -1;
+    const GAP = 7;
+    let dx = x - this.dragX, i = from;
+    while (i < vis.length - 1 && dx > (COL_W[vis[i]] + GAP) / 2) { dx -= COL_W[vis[i]] + GAP; i++; }
+    while (i > 0 && dx < -(COL_W[vis[i - 1]] + GAP) / 2) { dx += COL_W[vis[i - 1]] + GAP; i--; }
+    return i;
   }
 
   // Dragged onto another header: the column lands where that one was, on the side it
@@ -1167,8 +1183,7 @@ export default class Files extends View {
         .when(dragged, el => el.cursor_grabbing())
         .when(!dragged, el => el.cursor_grab())
         .when(target, el => el.child(div().absolute().top(0).bottom(0).left(-4).w(2).rounded(1).bg(t.accent)))
-        .on_mouse_down("left", (_e, cx) => { this.dragCol = k; this.overCol = k; cx.notify(); })
-        .on_mouse_move((_e, cx) => { if (this.dragCol && this.overCol !== k) { this.overCol = k; cx.notify(); } })
+        .on_mouse_down("left", (e, cx) => { this.dragCol = k; this.overCol = k; this.dragX = e.position.x; cx.notify(); })
         .on_mouse_up("left", (_e, cx) => { if (this.dragCol) { cx.stop_propagation(); this.dropCol(this.overCol, cx); } });
     };
     return h_flex().id("files-head").flex_none().h(21).px(14).gap(7).items_center().border_b(1).border_color(t.border)
@@ -1271,9 +1286,9 @@ export default class Files extends View {
       .bg(t.selected).border_b(1).border_color(t.border).text_size(11)
       .child(div().flex_none().text_color(t.ansi2).child("↑"))
       .child(div().flex_1().min_w(0).truncate().text_color(t.foreground)
-        .child(`v${u.version} 可用 · 当前 ${u.local}`))
-      .when(Boolean(u.url), el => el.child(act("files-update-notes", "更新说明", () => launch(u.url), true)))
-      .child(act("files-update-later", "稍后", (cx) => this.dismissUpdate(cx, true)))
+        .child(`v${u.version} available · you have ${u.local}`))
+      .when(Boolean(u.url), el => el.child(act("files-update-notes", "What's new", () => launch(u.url), true)))
+      .child(act("files-update-later", "Later", (cx) => this.dismissUpdate(cx, true)))
       .child(act("files-update-close", "✕", (cx) => this.dismissUpdate(cx, false)));
   }
 
@@ -1286,7 +1301,20 @@ export default class Files extends View {
       .on_drop((event, cx) => this.upload(event.paths, cx, this.selectedDir ? this.selected ?? "" : ""))
       // A header drag released anywhere else in the card is dropped, not left holding
       // a column: the next hover would otherwise move it again.
-      .on_mouse_up("left", (_e, cx) => { if (this.dragCol) { this.dragCol = null; this.overCol = null; cx.notify(); } })
+      // The pointer keeps bubbling its moves here while a column is in hand, which is
+      // the only place that sees the whole header: each cell goes quiet as soon as the
+      // pointer leaves it.
+      .on_mouse_move((e, cx) => {
+        if (!this.dragCol) return;
+        const k = this.visibleCols()[this.dragIndexAt(e.position.x)];
+        if (k && this.overCol !== k) { this.overCol = k; cx.notify(); }
+      })
+      .on_mouse_up("left", (_e, cx) => {
+        if (!this.dragCol) return;
+        const to = this.overCol;
+        if (to && to !== this.dragCol) this.dropCol(to, cx);
+        else { this.dragCol = null; this.overCol = null; cx.notify(); }
+      })
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .when(Boolean(this.file), el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => { this.show(null); cx.notify(); }).child("←")))
         .when(Boolean(this.file), el => el.child(image(iconSvg(iconOf(this.file))).w(15).h(15).flex_none()))
