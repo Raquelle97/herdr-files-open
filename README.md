@@ -80,6 +80,10 @@ A layout can pick the opening order:
 
 ## Columns
 
+**Drag a column label to move it.** Press `Modified`, `Type` or `Size`, drag it onto
+another column and let go: it lands where that one was, and a thin accent bar on the
+target says where. The click that ends a drag does not also sort.
+
 `⋮` at the left of the table header — or a right-click on any column label — opens the
 columns menu:
 
@@ -94,6 +98,30 @@ Both survive a restart, because they live in `mods/files-open/config.json`:
 ```
 
 Any column not named there follows in the default order: modified, type, size.
+
+## Update notice
+
+The panel can look for its own newer version and say so in a strip under the header:
+
+```
+↑ v1.6.0 available · current 1.5.0     Release notes   Later   ✕
+```
+
+`Release notes` opens the release page; `Later` stays quiet for 24 hours; `✕` drops that
+version for good (the next one still shows). Both are remembered in
+`mods/files-open/state.json`, so a restart keeps the decision.
+
+Nothing is requested until a repo is named in `config.json`:
+
+```json
+{ "updates": { "repo": "you/files-open", "check": true, "intervalHours": 6 } }
+```
+
+`repo` reads GitHub's `releases/latest` (its `tag_name`). A private repo, or a feed you
+host yourself, can be named as `feed` expecting `{"version": "1.6.0", "url": "…",
+"notes": "…"}`, with `token` / `tokenEnv` / `tokenFile` for the token (`tokenEnv` reads
+the environment, `tokenFile` the first line of a file — the token never has to sit in the
+config). The local version comes from `mod.json`'s `version`, else `config.json`'s.
 
 ## Config
 

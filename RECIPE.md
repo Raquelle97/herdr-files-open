@@ -14,7 +14,8 @@ One panel, 360 px wide by default, docked at the right of the window. A rounded 
 
 - **Header**, 42 px, 14 px side padding, 8 px gaps, border beneath. Left to right: `←`
   (only while a file is previewed, 20 px, `muted`, goes back to the tree), the previewed
-  file's 15 px colour icon (same condition), the word `Files` in semibold, `↩` once the
+  file's 15 px colour icon (same condition), the panel's own mark — `logo.png`, the pixel
+  Somali cat, 24 x 24 — then the word `Files` in semibold, `↩` once the
   tree has been jumped away from the pane's own folder, `↑` (goes to the parent folder;
   `border` colour instead of `muted` when there is nowhere to go), then pushed right a
   single line in 12 px `dim` — the previewed file's path, or the folder's name (`…/name`
@@ -29,7 +30,10 @@ One panel, 360 px wide by default, docked at the right of the window. A rounded 
   `dim`: `⋮` (opens the columns menu), `Name` (flexing), then the visible value columns in
   their configured order at fixed 74 / 46 / 54 px. The column in force is `accent`-coloured
   and carries an 8 px `▲` (ascending) or `▼`. Clicking a label sorts by it, clicking it
-  again reverses; right-clicking one opens the same columns menu. The `⋮` is first because
+  again reverses; right-clicking one opens the same columns menu. A value column can also be
+  dragged onto another: the one in hand goes to 45 % opacity, the one under the pointer gets
+  a `hover` background and a 2 px `accent` bar on its leading edge, and the drop lands the
+  column on the side it came from. The `⋮` is first because
   `Name` is the only cell that flexes — anywhere else and every column after it would shift
   by its width and stop lining up with the values.
 - **Tree**, 6 px padding, scrolling. Rows are 28 px tall, 7 px rounded, 8 px + 18 px per
@@ -107,6 +111,19 @@ case-insensitively with digits as numbers (`file2` before `file10`); `.git` is h
   the tie-break stays ascending. `sortKey`/`sortDesc` live on the view, which is why a
   refresh (`loadFolder` → `sorted`) and a jump (`land` → `sorted`) keep the order. A layout
   can seed them with `props: {"sort": "date", "sortDesc": true}`.
+- **Columns drag.** A press on a value column's label sets `dragCol`, `on_mouse_move` on
+  each label records `overCol` (the element under the pointer is the target — no pointer
+  maths, no capture), and the release runs `dropCol`, which rebuilds `colOrder` with the
+  dragged key spliced in beside its target on the side it came from. `droppedAt` swallows
+  the click that the same release fires, so a drag never also sorts. A release anywhere
+  else in the card just clears both, which the root's `on_mouse_up` does.
+- **Update banner.** `checkUpdate` runs in `init`, reads `updates` from `config.json` and
+  asks at most once per `intervalHours`, caching the answer in `state.json` (`latest`,
+  `checkedAt`) so a restart neither re-asks nor forgets. `versionNewer` compares numeric
+  parts, `localVersion()` reads `mod.json`'s `version` and falls back to the config's. A
+  newer version renders a 26 px strip under the header: `更新说明` opens the release page,
+  `稍后` writes `snoozeUntil` (+24 h), `✕` writes `dismissedVersion`; both are read back
+  before the banner is allowed to appear again.
 - **Double-click a folder walks in** (`enter` → `jumpTo` with a relative path, so it becomes
   the root); `↑` calls `goUp`, which asks `parentOf` for the parent, jumps there and passes
   `{expand: base(oldRoot)}` so `land` re-opens and selects the folder just left. A single
@@ -193,3 +210,8 @@ standard library only).
    `This folder is empty`.
 10. `⋮` in the table header hides `Type` and moves `Size` before `Modified`; both are still
     that way after the app restarts, and `config.json` carries `columns`/`hiddenColumns`.
+11. Dragging the `Size` label onto `Modified` puts `Size` first, the accent bar shows where
+    it will land, the drag does not also sort, and the new order survives a restart.
+12. With `updates.repo` (or `feed`) set to something newer than `mod.json`'s version, the
+    strip appears under the header; `稍后` hides it for a day and `✕` for that version,
+    both across a restart, and with the keys empty no request is made at all.

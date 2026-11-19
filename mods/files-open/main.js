@@ -151,6 +151,96 @@ async function rememberSaveDir(dir) {
   } catch {}
 }
 
+// ── Updates ─────────────────────────────────────────────────────────────────
+// One GitHub request, only when a repo is configured: no `updates.repo` (or
+// `updates.feed`) means no request at all.
+//
+//   "updates":  { "repo": "me/files-open", "check": true, "intervalHours": 6 }
+//
+// A private repo reads its token from `updates.token`, or `tokenEnv` /
+// `tokenFile` so the token itself never sits in the config.
+const STATE_FILE = `${appHome()}/mods/files-open/state.json`;
+
+async function readState() {
+  try { return JSON.parse((await readTextFile(STATE_FILE)) ?? "{}") ?? {}; } catch { return {}; }
+}
+async function writeState(patch) {
+  try {
+    const before = (await readTextFile(STATE_FILE)) ?? null;
+    const state = before ? (JSON.parse(before) ?? {}) : {};
+    await writeTextFile(STATE_FILE, JSON.stringify({ ...state, ...patch }, null, 2) + "\n", before);
+  } catch {}
+}
+
+async function tokenOf(cfg) {
+  if (typeof cfg?.token === "string" && cfg.token.trim()) return cfg.token.trim();
+  if (typeof cfg?.tokenEnv === "string" && cfg.tokenEnv.trim()) return String((await env(cfg.tokenEnv.trim())) ?? "").trim() || null;
+  if (typeof cfg?.tokenFile === "string" && cfg.tokenFile.trim()) {
+    try { return ((await readTextFile(cfg.tokenFile.trim())) ?? "").split(/\r?\n/)[0].trim() || null; } catch { return null; }
+  }
+  return null;
+}
+async function env(name) {
+  try {
+    if (window()?.platform === "windows") {
+      const r = await exec("powershell", ["-NoProfile", "-Command", `[Environment]::GetEnvironmentVariable('${name}')`]);
+      return (r.stdout || "").trim();
+    }
+    const r = await exec("sh", ["-c", `printf %s "$${name}"`]);
+    return (r.stdout || "").trim();
+  } catch { return ""; }
+}
+
+// One request, through curl: it is on Windows 10+ and on every unix, and a body
+// written to a file never meets a shell that could mangle its quotes or newlines.
+// The status line comes back through --write-out so an HTTP 422 is not a silent 0.
+async function httpJson(method, url, { token, body } = {}) {
+  const args = ["-sS", "--max-time", "25", "-X", method, url,
+    "-H", "Accept: application/vnd.github+json", "-H", "User-Agent: herdr-files-open",
+    "-w", "\n%{http_code}"];
+  if (token) args.push("-H", `Authorization: Bearer ${token}`);
+  let tmp = null;
+  if (body !== undefined) {
+    tmp = `${appHome()}/mods/files-open/.request.json`;
+    try { await writeTextFile(tmp, JSON.stringify(body), null); } catch { tmp = null; }
+    if (tmp) args.push("-H", "Content-Type: application/json", "--data-binary", `@${tmp}`);
+  }
+  let out;
+  try { out = await exec("curl", args); }
+  catch (e) { return { ok: false, status: 0, error: `curl 起不来：${e}` }; }
+  const text = String(out?.stdout ?? "");
+  const at = text.lastIndexOf("\n");
+  const status = Number((at >= 0 ? text.slice(at + 1) : text).trim()) || 0;
+  const payload = at >= 0 ? text.slice(0, at) : "";
+  if (out?.code !== 0) return { ok: false, status, error: (out?.stderr || "").trim() || "网络请求失败" };
+  let json = null;
+  try { json = payload.trim() ? JSON.parse(payload) : null; } catch {}
+  // A file:// feed answers with no HTTP status at all; a parsed body is the answer.
+  const ok = (status >= 200 && status < 300) || (status === 0 && json !== null);
+  return { ok, status, json, text: payload };
+}
+
+// The version the panel reports: mod.json when it carries one, else config "version".
+async function localVersion() {
+  try {
+    const m = JSON.parse((await readTextFile(`${appHome()}/mods/files-open/mod.json`)) ?? "{}");
+    if (m?.version) return String(m.version);
+  } catch {}
+  return String((await readConfig())?.version ?? "");
+}
+
+// 1.2.10 > 1.2.9: a plain string compare would put them the other way round.
+function versionNewer(a, b) {
+  const parse = (v) => String(v ?? "").replace(/^v/i, "").split(/[.\-+]/).map((n) => Number.parseInt(n, 10) || 0);
+  const x = parse(a), y = parse(b);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const d = (x[i] ?? 0) - (y[i] ?? 0);
+    if (d) return d > 0;
+  }
+  return false;
+}
+
+
 async function makeDir(dir) {
   if (platform() === "windows") {
     const q = String(winpath(dir)).replace(/'/g, "''");
@@ -466,6 +556,9 @@ export default class Files extends View {
     if (props()?.fileMenu || props()?.colMenu) return;
     this.saved = new Map();
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
+    // A newer version, once found, stays found: the banner sits until it is dealt with.
+    this.update = null;
+    this.checkUpdate(cx);
     // When this view appeared: a menu's note is left in shared state, and a view that
     // starts later must not act on one an earlier view was asked to do.
     this.bornAt = Date.now();
@@ -479,6 +572,12 @@ export default class Files extends View {
     this.colOrder = COL_DEFS.slice();
     this.colHidden = new Set();
     this.loadCols(cx);
+    // Dragging a column header: the one in hand, and the one under the pointer that
+    // it would land on. Both clear on release; the timestamp swallows the click that
+    // the same release would otherwise read as "sort by this column".
+    this.dragCol = null;
+    this.overCol = null;
+    this.droppedAt = 0;
     // The header path doubles as an address bar: click it, type, Enter.
     this.editing = false;
     this.input = InputState.new({ placeholder: "path — Enter to go, empty Enter to cancel" });
@@ -575,6 +674,21 @@ export default class Files extends View {
     cx.notify();
   }
 
+  // Dragged onto another header: the column lands where that one was, on the side it
+  // came from, and the hidden ones stay behind in the tail of the order.
+  dropCol(to, cx) {
+    const from = this.dragCol;
+    this.dragCol = null; this.overCol = null;
+    const vis = this.visibleCols(), a = vis.indexOf(from), b = vis.indexOf(to);
+    if (a < 0 || b < 0 || a === b) { cx.notify(); return; }
+    const list = vis.filter(k => k !== from);
+    list.splice(list.indexOf(to) + (a < b ? 1 : 0), 0, from);
+    this.colOrder = [...list, ...this.colOrder.filter(k => this.colHidden.has(k))];
+    this.droppedAt = Date.now();
+    this.saveCols();
+    cx.notify();
+  }
+
   colMenu(cx) {
     openOverlay({
       mod: "files-open", kind: "popup", at: "pointer", width: 214,
@@ -606,7 +720,7 @@ export default class Files extends View {
         .when(!fixed, el => el.child(arrow("←", -1, at <= 0)).child(arrow("→", 1, at < 0 || at === vis.length - 1)));
     };
     return v_flex().id("files-col-menu").w_full().p(4).bg(t.popover).text_color(t.foreground).text_size(12.5)
-      .child(div().px(7).pt(3).pb(5).text_size(11).text_color(t.dim).child("Columns · ✓ shows, ← → moves"))
+      .child(div().px(7).pt(3).pb(5).text_size(11).text_color(t.dim).child("Columns · ✓ shows · drag a header to move"))
       .children(["name", ...COL_DEFS].map(row));
   }
 
@@ -1030,19 +1144,32 @@ export default class Files extends View {
   // A table header: the columns the rows are made of, and the place a click sorts by —
   // clicking the column already sorted reverses it. The ⋮ sits first, before the name,
   // because the name is the one cell that flexes: put it last and every column would
-  // shift left by its width and stop lining up with the values under it.
+  // shift left by its width and stop lining up with the values under it. A value column
+  // can be dragged onto another and lands on the side it came from; the name stays put,
+  // since it is the row itself.
   headerRow(t) {
     const active = (k) => this.sortKey === k;
     const col = (k, label, w, right = false) => {
-      const cell = h_flex().id(`files-col-${k}`).h_full().flex_none().items_center().gap(3).truncate().cursor_pointer()
+      const dragged = this.dragCol === k, target = Boolean(this.dragCol) && this.overCol === k && !dragged;
+      const cell = h_flex().id(`files-col-${k}`).relative().h_full().flex_none().items_center().gap(3).truncate().cursor_pointer()
         .text_size(10.5).text_color(active(k) ? t.accent : t.dim)
         .hover(s => s.text_color(t.foreground))
-        .on_click((_e, cx) => this.setSort(k, cx))
+        .on_click((_e, cx) => { if (Date.now() - this.droppedAt > 250) this.setSort(k, cx); })
         .on_mouse_down("right", (_e, cx) => this.colMenu(cx))
+        .when(dragged, el => el.opacity(0.45))
+        .when(target, el => el.bg(t.hover))
         .when(right, el => el.justify_end())
         .child(div().truncate().child(label))
         .when(active(k), el => el.child(div().text_size(8).child(this.sortDesc ? "▼" : "▲")));
-      return w ? cell.w(w) : cell.flex_1().min_w(0);
+      if (!w) return cell.flex_1().min_w(0);
+      return cell.w(w)
+        .tooltip("Click to sort · drag onto another column to move it")
+        .when(dragged, el => el.cursor_grabbing())
+        .when(!dragged, el => el.cursor_grab())
+        .when(target, el => el.child(div().absolute().top(0).bottom(0).left(-4).w(2).rounded(1).bg(t.accent)))
+        .on_mouse_down("left", (_e, cx) => { this.dragCol = k; this.overCol = k; cx.notify(); })
+        .on_mouse_move((_e, cx) => { if (this.dragCol && this.overCol !== k) { this.overCol = k; cx.notify(); } })
+        .on_mouse_up("left", (_e, cx) => { if (this.dragCol) { cx.stop_propagation(); this.dropCol(this.overCol, cx); } });
     };
     return h_flex().id("files-head").flex_none().h(21).px(14).gap(7).items_center().border_b(1).border_color(t.border)
       .child(div().id("files-cols").flex_none().w(14).text_center().cursor_pointer().text_size(12).text_color(t.muted)
@@ -1086,6 +1213,70 @@ export default class Files extends View {
     return out;
   }
 
+  // ── Update banner ────────────────────────────────────────────────────────
+  // Asks GitHub once per `intervalHours`; what it learned is kept in state.json so a
+  // restart inside the window neither asks again nor forgets the banner it earned.
+  // No `updates.repo` (or `updates.feed`) means it never runs at all.
+  async checkUpdate(cx) {
+    const cfg = await readConfig();
+    const up = cfg?.updates ?? {};
+    if (up.check === false) return;
+    const repo = String(up.repo ?? "").trim();
+    const url = String(up.feed ?? "").trim()
+      || (repo ? `https://api.github.com/repos/${repo}/releases/latest` : "");
+    if (!url) return;
+    const state = await readState();
+    const every = Math.max(1, Number(up.intervalHours) || 6) * 3600000;
+    let latest = state.latest ?? null;
+    if (!latest || !state.checkedAt || Date.now() - Number(state.checkedAt) > every) {
+      const r = await httpJson("GET", url, { token: await tokenOf(cfg?.updates) });
+      if (r.ok && r.json) {
+        const next = {
+          version: String(r.json.version ?? r.json.tag_name ?? "").replace(/^v/i, "").trim(),
+          notes: String(r.json.notes ?? r.json.body ?? "").slice(0, 600),
+          url: String(r.json.url ?? r.json.html_url ?? ""),
+        };
+        if (next.version) {
+          latest = next;
+          await writeState({ latest: next, checkedAt: Date.now() });
+        }
+      }
+    }
+    if (!latest?.version) return;
+    const local = await localVersion();
+    if (!local || !versionNewer(latest.version, local)) return;
+    if (state.dismissedVersion === latest.version) return;
+    if (Number(state.snoozeUntil) > Date.now()) return;
+    this.update = { ...latest, local };
+    cx.notify();
+  }
+
+  // Later: quiet for a day. ✕: this version is not news any more.
+  async dismissUpdate(cx, snooze) {
+    const v = this.update?.version;
+    this.update = null;
+    cx.notify();
+    if (!v) return;
+    if (snooze) await writeState({ snoozeUntil: Date.now() + 24 * 3600000 });
+    else await writeState({ dismissedVersion: v, snoozeUntil: 0 });
+  }
+
+  renderUpdate(t, cx) {
+    const u = this.update;
+    if (!u) return div();
+    const act = (id, text, run, accent = false) => div().id(id).flex_none().cursor_pointer().text_size(11)
+      .text_color(accent ? t.accent : t.muted).hover(s => s.text_color(t.foreground))
+      .on_click((_e, cx) => { cx.stop_propagation(); run(cx); }).child(text);
+    return h_flex().id("files-update").flex_none().h(26).px(12).gap(9).items_center()
+      .bg(t.selected).border_b(1).border_color(t.border).text_size(11)
+      .child(div().flex_none().text_color(t.ansi2).child("↑"))
+      .child(div().flex_1().min_w(0).truncate().text_color(t.foreground)
+        .child(`v${u.version} 可用 · 当前 ${u.local}`))
+      .when(Boolean(u.url), el => el.child(act("files-update-notes", "更新说明", () => launch(u.url), true)))
+      .child(act("files-update-later", "稍后", (cx) => this.dismissUpdate(cx, true)))
+      .child(act("files-update-close", "✕", (cx) => this.dismissUpdate(cx, false)));
+  }
+
   render(cx) {
     const t = theme();
     if (props()?.fileMenu) return this.renderMenu(t);
@@ -1093,9 +1284,15 @@ export default class Files extends View {
     if (key() !== this.context?.key) this.refresh(cx);
     return v_flex().id("files").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
       .on_drop((event, cx) => this.upload(event.paths, cx, this.selectedDir ? this.selected ?? "" : ""))
+      // A header drag released anywhere else in the card is dropped, not left holding
+      // a column: the next hover would otherwise move it again.
+      .on_mouse_up("left", (_e, cx) => { if (this.dragCol) { this.dragCol = null; this.overCol = null; cx.notify(); } })
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .when(Boolean(this.file), el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => { this.show(null); cx.notify(); }).child("←")))
         .when(Boolean(this.file), el => el.child(image(iconSvg(iconOf(this.file))).w(15).h(15).flex_none()))
+        // The cat is the panel's mark; the word still says what it is, and both fit in
+        // the 42 px header at a panel that is often half a screen wide.
+        .child(div().id("files-logo").flex_none().child(image("mods/files-open/logo.png").w(24).h(24)))
         .child(div().font_semibold().child("Files"))
         .when(Boolean(this.baseCwd) && this.root !== this.baseCwd, el => el.child(div().id("files-home").px(3).cursor_pointer()
           .text_color(t.muted).hover(s => s.text_color(t.foreground))
@@ -1109,6 +1306,7 @@ export default class Files extends View {
           .on_click((_e, cx) => this.startUpload(cx)).child("Upload")))
         .when(Boolean(this.file), el => el.child(div().id("files-open-ext").px(6).cursor_pointer().text_color(t.muted).hover(s => s.text_color(t.foreground))
           .on_click((_e, cx) => this.handOff(this.file, cx)).child("↗"))))
+      .when(Boolean(this.update), el => el.child(this.renderUpdate(t, cx)))
       .when(Boolean(this.status || this.hint), el => el.child(div().px(12).py(5).flex_none().border_b(1).border_color(t.border).text_size(11)
         .text_color(this.failed ? t.ansi1 : t.dim).truncate().child(this.status || this.hint)))
       .when(Boolean(this.job), el => el.child(this.jobRow(t)))
