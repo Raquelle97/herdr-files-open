@@ -901,12 +901,13 @@ export default class Files extends View {
       : this.file ?? this.rootLabel();
     // Drawn as a field, not as a label: the border is the hint that this is where a
     // path can be typed. Right-click copies it instead.
-    return h_flex().id("files-path").flex_1().min_w(0).h(24).px(7).items_center().justify_end().rounded(6)
+    return h_flex().id("files-path").flex_1().min_w(0).h(24).px(7).items_center().rounded(6)
       .border_1().border_color(t.border).bg(t.background).cursor_pointer()
       .hover(s => s.border_color(t.accent).text_color(t.foreground))
       .on_click((_e, cx) => this.beginJump(cx))
       .on_mouse_down("right", (_e, cx) => this.copyPath(this.file ?? "", cx))
-      .child(div().min_w(0).truncate().text_size(12).text_color(this.copied ? t.ansi2 : t.dim).child(label));
+      .child(div().flex_1().min_w(0).truncate().text_right().text_size(12)
+        .text_color(this.copied ? t.ansi2 : t.dim).child(label));
   }
 
   // Hand the file to the OS: local paths straight away, remote ones after an scp.
