@@ -15,23 +15,39 @@ One panel, 360 px wide by default, docked at the right of the window. A rounded 
 - **Header**, 42 px, 14 px side padding, 8 px gaps, border beneath. Left to right: `←`
   (only while a file is previewed, 20 px, `muted`, goes back to the tree), the previewed
   file's 15 px colour icon (same condition), the word `Files` in semibold, `↩` once the
-  tree has been jumped away from the pane's own folder, then pushed right a single line in
-  12 px `dim` — the previewed file's path, or the folder's name (`…/name` after a jump) —
-  which truncates with an ellipsis and is the same hit target for right-click copy. Click
-  that line and it becomes an `Input` (24 px, 6 px radius, 1 px `accent` border) holding the
-  full path; see the address bar below. When a file is previewed, `↗` (6 px padding,
-  `muted`, `foreground` on hover) opens it in the OS app.
+  tree has been jumped away from the pane's own folder, `↑` (goes to the parent folder;
+  `border` colour instead of `muted` when there is nowhere to go), then pushed right a
+  single line in 12 px `dim` — the previewed file's path, or the folder's name (`…/name`
+  after a jump) — which truncates with an ellipsis and is the same hit target for
+  right-click copy. Then the word `Upload` (11.5 px, `muted`, `foreground` on hover).
+  The path line is drawn as a field — 24 px tall, 6 px radius, 1 px `border`, right
+  aligned, `accent` border and `foreground` text on hover — so it reads as the place to
+  type. Click it and it becomes an `Input` holding the full path, selected; see the
+  address bar below. When a file is previewed, `↗` (6 px padding, `muted`, `foreground`
+  on hover) opens it in the OS app.
+- **Table header**, 21 px, 14 px side padding, 7 px gaps, border beneath, 10.5 px labels in
+  `dim`: `⋮` (opens the columns menu), `Name` (flexing), then the visible value columns in
+  their configured order at fixed 74 / 46 / 54 px. The column in force is `accent`-coloured
+  and carries an 8 px `▲` (ascending) or `▼`. Clicking a label sorts by it, clicking it
+  again reverses; right-clicking one opens the same columns menu. The `⋮` is first because
+  `Name` is the only cell that flexes — anywhere else and every column after it would shift
+  by its width and stop lining up with the values.
 - **Tree**, 6 px padding, scrolling. Rows are 28 px tall, 7 px rounded, 8 px + 18 px per
   depth of left padding, 8 px right, 7 px gaps, `hover` background under the pointer.
   Each row: a 12 px chevron in `dim` for folders (down when open, right when closed) or a
   12 px gap for files; a 15 px full-colour icon; the name, 13 px, flexing and truncating;
-  `↗` in 10 px `dim` for a file type that opens externally; a git mark letter when the
-  worktree reports one (`A` green, `D`/`U` red, other `blocked`).
+  then the three fixed columns in 10.5 px `dim` — the timestamp (`11-18 17:05`, or
+  `2025-11-18` outside this year), the extension (`folder` for a directory, `—` when it
+  has none) and the size (`315 KB`; blank for a folder); `↗` for a file type that opens
+  externally; a git mark letter when the worktree reports one (`A` green, `D`/`U` red,
+  other `blocked`).
 - **Preview**, the rest of the card: a read-only editor for a text file, or a 12 px
   `dim` line saying what is happening ("Downloading from login07…", "Cannot open: …").
-  Empty folders and errors show a 12 px `dim` line inside the tree instead.
+  Empty folders and errors show a 12 px line inside the tree instead — `This folder is
+  empty`, or the reason in `ansi1`.
 
-Folders sort first, then files, both case-insensitively by name. `.git` is hidden.
+Folders sort first, then the chosen field, then the name as a tie-break. Names compare
+case-insensitively with digits as numbers (`file2` before `file10`); `.git` is hidden.
 
 ## How it behaves
 
@@ -71,13 +87,38 @@ Folders sort first, then files, both case-insensitively by name. `.git` is hidde
   folder path is the only form that lands, and it is what the request was for anyway.
   `open -R` on macOS has no such problem — its switch is `-R`, not a leading slash.
 - **The address bar.** Clicking the path line sets `editing`, fills the `InputState` with
-  the full path (or the previewed file's), and focuses it; `submit` runs `jumpTo`, `blur`
-  drops back to the plain line. A typed path goes through `resolvePath`: `~` and `~/…`
-  become `home()`, a bare name is joined to the folder on screen, `\` becomes `/`, and
-  `..` is folded by hand — so a jump never shows a `../..` root. The target is then listed
-  with `directory()`; success moves the tree there, failure is retried against the target's
-  parent, and if the parent does list a file of that name the tree moves there and previews
-  it. Anything else says `Not a folder: <path>`.
+  the full path (or the previewed file's) and selects it, so typing replaces it and Enter
+  alone changes nothing; `submit` runs `jumpTo`, `blur` drops back to the plain field. A
+  typed path goes through `resolvePath`: `~` and `~/…` become the machine's home (asked
+  once per machine through the listing channel — a container's `~` is not what `ssh`
+  reports), a bare name is joined to the folder on screen, `\` becomes `/`, and `..` is
+  folded by hand — so a jump never shows a `../..` root. The target is then listed with
+  `directory()`; success moves the tree there, failure is retried against the target's
+  parent, and if the parent does list a *file* of that name the tree moves there and
+  previews it. Anything else reports why, in red under the header for 4.2 s, with the tree
+  left where it was: `Not found: <path>`, `Permission denied: <path>`, `Not a folder:
+  <path>`. The reason comes from an exit code — the sh script exits 2 missing, 3
+  unreadable, 4 not-a-directory, and the Windows listing exits the same way after its own
+  `Test-Path -PathType Container` — so the common cases need no message parsing.
+- **Column headers sort.** `setSort` flips the direction when the field is already the one
+  in force, otherwise switches field and starts ascending; `resortAll()` re-sorts the
+  arrays in hand, so a click costs no listing. `sorted()` puts folders first, then
+  `compareBy(field)`, then the name; the sign of the comparison flips with `sortDesc` but
+  the tie-break stays ascending. `sortKey`/`sortDesc` live on the view, which is why a
+  refresh (`loadFolder` → `sorted`) and a jump (`land` → `sorted`) keep the order. A layout
+  can seed them with `props: {"sort": "date", "sortDesc": true}`.
+- **Double-click a folder walks in** (`enter` → `jumpTo` with a relative path, so it becomes
+  the root); `↑` calls `goUp`, which asks `parentOf` for the parent, jumps there and passes
+  `{expand: base(oldRoot)}` so `land` re-opens and selects the folder just left. A single
+  click keeps the in-place expand.
+- **Columns hide and move** from the `⋮` menu, which is this mod's third popup: `ask()` leaves
+  `{what: "coltoggle" | "colmove"}` for `takeIntent`, so the work happens in the view that
+  owns the tree. `colOrder` keeps every key in display order and `colHidden` says which of
+  the three are off; `visibleCols()` is what both the header and the rows walk, so they
+  cannot drift apart. Hiding and moving call `saveCols()`, which merges into `config.json`
+  with `writeTextFile(path, text, before)` — the `before` is what makes a concurrent edit
+  fail instead of being clobbered. `loadCols()` reads the same two keys in `init` and
+  appends any key the file does not mention.
 - A jump rewrites `this.context.cwd` as well as `this.root`: `loadFolder` reads the folder
   out of its `context` argument, and the 10 s refresh keys off `location()`, which the jump
   does not change — only the context edit makes the next reload land in the new folder.
@@ -143,3 +184,12 @@ standard library only).
    "Downloading from <machine>…" first and the file appears in the cache folder.
 5. Right-clicking a row shows `✓` and paste puts that absolute path in the clipboard.
 6. A folder with more than 500 entries still opens, with the "limited" note under the tree.
+7. Clicking `Size` orders by size, a second click reverses it, a `▼` on the header says
+   which way; `↑` then walks up and the order survives the move.
+8. Double-clicking a folder makes it the root (`…/name` in the header); `↑` returns, and
+   the folder just left is open and selected.
+9. Typing `~/…` in the path field lands in the machine's home, `nope/xyz` says
+   `Not found: <path>` in red and leaves the tree alone, and an empty folder says
+   `This folder is empty`.
+10. `⋮` in the table header hides `Type` and moves `Size` before `Modified`; both are still
+    that way after the app restarts, and `config.json` carries `columns`/`hiddenColumns`.

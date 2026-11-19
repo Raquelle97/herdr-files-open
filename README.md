@@ -32,18 +32,26 @@ yourself — a block whose content is `{ "mod": "files-open" }`.
 
 ## Use
 
-- click a folder to expand it, again to close
+- click a folder to expand it, again to close; **double-click** a folder to walk into it —
+  it becomes the root of the tree, the header reads `…/name`, and `↑` beside it leads back
+  out (the folder just left re-opens and is selected)
 - click a text file to preview it in the panel; markdown renders as markdown
 - **click the path in the header** and it turns into a box: type an absolute path, `~`, or
   a name relative to the folder on screen, then Enter. A path to a file opens its folder
   with that file previewed. While the tree sits somewhere else the header reads `…/name`
   and a `↩` next to `Files` takes it back to the pane's own folder
+- a path it cannot use says why: `Not found: …`, `Permission denied: …`, `Not a folder: …`
+  in red under the header for a few seconds, with the tree left where it was; an empty
+  folder simply reads `This folder is empty`
+- `~` is the home of **the machine the panel is looking at**: this computer for a local
+  pane, and for a remote one the far side is asked once over the same channel the listings
+  use — so a container whose `~` differs from what `ssh` reports still lands right
 - click a pdf, image, docx, zip… to just select it — it needs a double-click or the menu
 - **double-click** any file to open it in the OS default app
 - **right-click** a row: Preview, Open with default app, Open with…, Download,
   Download to…, Copy path (folders: Download folder, Download folder to…,
   Upload files here…, Copy path) — a folder comes down whole, subfolders included
-- **`⤒` in the header**, or `Upload files here…`, picks files from this computer and copies
+- **`Upload` in the header**, or `Upload files here…`, picks files from this computer and copies
   them into the folder on screen — over scp when the pane is on another machine
 - **drag files or folders onto the panel** to upload them; with a folder row selected they
   land inside that folder
@@ -53,6 +61,39 @@ yourself — a block whose content is `{ "mod": "files-open" }`.
 - uploads and downloads never overwrite: a clash becomes `name (1).ext`
 - a finished download opens the folder it landed in (Finder selects the file itself;
   `"reveal": false` turns this off)
+
+## Sorting
+
+The list is a four-column table: name, modified, type, size. Click a column header to sort
+by it, click it again to reverse — a small `▲`/`▼` on the header points the way. Folders
+always come first, ties fall back to the name, and digits compare as numbers (`file2` sorts
+before `file10`).
+
+The order lives on the view rather than on one listing, so a refresh, a jump or a walk up
+the tree keeps it.
+
+A layout can pick the opening order:
+
+```json
+{ "mod": "files-open", "props": { "sort": "date", "sortDesc": true } }
+```
+
+## Columns
+
+`⋮` at the left of the table header — or a right-click on any column label — opens the
+columns menu:
+
+- `✓` is whether the column shows; click the mark to hide it, click again to bring it back.
+  Name is the row itself, so it never hides.
+- `←` `→` move that column past its visible neighbour; the arrow greys out at either end.
+
+Both survive a restart, because they live in `mods/files-open/config.json`:
+
+```json
+{ "columns": ["size", "date"], "hiddenColumns": ["type"] }
+```
+
+Any column not named there follows in the default order: modified, type, size.
 
 ## Config
 

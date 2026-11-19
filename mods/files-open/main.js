@@ -8,7 +8,7 @@
 // system default app instead — locally at once, or after downloading from that machine.
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView, Input, InputState } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, home, appHome, notify,
+import { spaces, panes, focused, exec, readTextFile, writeTextFile, watchFolder, theme, settings, window, home, appHome, notify,
   props, openOverlay, closeOverlay, pickFolder, setShared, shared } from "herdr";
 
 // Extensions that are far better in a real viewer than as syntax-highlighted text.
@@ -316,9 +316,95 @@ function location() {
 const key = () => JSON.stringify(location());
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html", md: "markdown" };
 const PER_FOLDER = 500, TOTAL = 5000;
-// Folders first, then by name — the order a jump and a refresh both use.
-const sortEntries = (entries) =>
-  entries.slice().sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name));
+
+// Ordering. Folders always come first, then the field a column header picked, then
+// the name as a tie-break — so a size sort still reads alphabetically inside a
+// run of equal sizes. Lists are re-sorted from the stored entries rather than from a
+// second listing, which is what keeps the order across a refresh or a jump.
+const SORT_FIELDS = ["name", "date", "type", "size"];
+
+// Natural order: `file2` before `file10`, and case never decides the winner.
+function nlCompare(a, b) {
+  const ax = String(a).toLowerCase(), bx = String(b).toLowerCase();
+  const an = ax.match(/\d+|\D+/g) ?? [], bn = bx.match(/\d+|\D+/g) ?? [];
+  const n = Math.min(an.length, bn.length);
+  for (let i = 0; i < n; i++) {
+    const x = an[i], y = bn[i];
+    if (x === y) continue;
+    if (/^\d/.test(x) && /^\d/.test(y)) {
+      const d = Number(x) - Number(y);
+      if (d) return d < 0 ? -1 : 1;
+      continue;
+    }
+    return x < y ? -1 : 1;
+  }
+  if (an.length !== bn.length) return an.length - bn.length;
+  return ax === bx ? 0 : ax < bx ? -1 : 1;
+}
+
+// Type is the extension: a folder sorts as its own kind, before every extension.
+const typeOf = (e) => (e.dir ? "" : extOf(e.name));
+
+function compareBy(key, a, b) {
+  if (key === "date") return (a.ms ?? 0) - (b.ms ?? 0);
+  if (key === "size") return (a.dir ? -1 : a.size ?? 0) - (b.dir ? -1 : b.size ?? 0);
+  if (key === "type") return nlCompare(typeOf(a), typeOf(b));
+  return nlCompare(a.name, b.name);
+}
+
+// The three right-hand columns: fixed widths, so a header cell and the value under it
+// line up at every depth of the tree. `Name` is not among them — it is the row — but it
+// can still be sorted by, and the rest can be hidden or moved, from the columns menu.
+const COL_W = { date: 74, type: 46, size: 54 };
+const COL_DEFS = ["date", "type", "size"];
+const COL_LABEL = { name: "Name", date: "Modified", type: "Type", size: "Size" };
+const colText = (e, k) =>
+  k === "date" ? fmtWhen(e.ms)
+    : k === "type" ? (e.dir ? "folder" : (extOf(e.name) || "—"))
+      : e.dir ? "" : fmtBytes(e.size);
+
+// Time for something from this year, date for anything older — narrow enough to sit
+// in a panel that is often half a screen wide.
+function fmtWhen(ms) {
+  if (!ms) return "";
+  const d = new Date(ms), now = new Date(), p = (n) => String(n).padStart(2, "0");
+  const md = `${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  if (d.getFullYear() !== now.getFullYear()) return `${d.getFullYear()}-${md}`;
+  return `${md} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// The folder one level up, spelled the way this path already is. Null at a root, so
+// the ↑ button knows there is nowhere left to go.
+function parentOf(p) {
+  const s = String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!s) return null;
+  const cut = s.replace(/\/[^/]*$/, "");
+  if (cut === s) return null;
+  if (/^[A-Za-z]:$/.test(cut)) return `${cut}/`;
+  return cut || "/";
+}
+
+// Why a folder could not be listed, in words that say what to do about it. The sh
+// script exits 2/3/4 and PowerShell exits the same way, so the kind is usually known
+// before the message is read.
+function folderError(kind, msg) {
+  const e = new Error(msg);
+  e.kind = kind;
+  return e;
+}
+function errText(e, target) {
+  const raw = String(e?.stderr || e?.message || e || "").trim();
+  const kind = e?.kind
+    ?? (/denied|permission|拒绝访问|没有访问|EACCES|EPERM/i.test(raw) ? "denied"
+      : /not a directory|ENOTDIR/i.test(raw) ? "notdir"
+      : /cannot find|does not exist|not found|找不到|不存在|ENOENT/i.test(raw) ? "missing"
+      : "other");
+  if (kind === "denied") return `Permission denied: ${target}`;
+  if (kind === "missing") return `Not found: ${target}`;
+  if (kind === "notdir") return `Not a folder: ${target}`;
+  const why = raw.split("\n")[0].slice(0, 120);
+  return why ? `Cannot open ${target} · ${why}` : `Cannot open ${target}`;
+}
 
 async function directory(path, on) {
   const windowsDirectory = async () => {
@@ -326,31 +412,73 @@ async function directory(path, on) {
     // Links keep directory attributes even when dangling; check their target.
     // Other reparse points (OneDrive's folders) have no LinkType and are folders.
     // PowerShell reads curly single quotes as quotes too, so they're doubled like '.
-    const r = await exec("powershell", ["-NoProfile", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { param($p) @(Get-ChildItem -LiteralPath $p -Force -ErrorAction Stop | Where-Object Name -ne '.git' | Select-Object -First 501 | ForEach-Object { @{ name=$_.Name; dir=($_.PSIsContainer -and (-not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not $_.LinkType -or ($_.Target -and [IO.Directory]::Exists(([IO.Path]::Combine([IO.Path]::GetDirectoryName($_.FullName), $_.Target[0])))))) } }) | ConvertTo-Json -Compress } '" + path.replace(/['‘’‚‛]/g, "$&$&") + "'"], { on });
-    if (r.code !== 0) throw new Error(r.stderr || "Cannot list this folder");
+    // A file path would otherwise list itself as one entry, so it is reported as
+    // "not a folder" (4) and the caller can preview it instead of navigating into it.
+    const ps = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { param($p) "
+      + "if (-not (Test-Path -LiteralPath $p -PathType Container)) { if (Test-Path -LiteralPath $p) { exit 4 } else { exit 2 } } "
+      + "@(Get-ChildItem -LiteralPath $p -Force -ErrorAction Stop | Where-Object Name -ne '.git' | Select-Object -First 501 "
+      + "| ForEach-Object { @{ name=$_.Name; size=[long]$_.Length; "
+      + "ms=[long]($_.LastWriteTimeUtc - [datetime]::new(1970,1,1,0,0,0,[System.DateTimeKind]::Utc)).TotalMilliseconds; "
+      + "dir=($_.PSIsContainer -and (-not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not $_.LinkType "
+      + "-or ($_.Target -and [IO.Directory]::Exists(([IO.Path]::Combine([IO.Path]::GetDirectoryName($_.FullName), $_.Target[0])))))) } }) "
+      + "| ConvertTo-Json -Compress } '" + path.replace(/['‘’‚‛]/g, "$&$&") + "'";
+    const r = await exec("powershell", ["-NoProfile", "-Command", ps], { on });
+    if (r.code === 2) throw folderError("missing", "Not found");
+    if (r.code === 4) throw folderError("notdir", "Not a folder");
+    if (r.code !== 0) throw folderError(null, r.stderr || "Cannot list this folder");
     const result = JSON.parse(r.stdout || "[]");
     return Array.isArray(result) ? result : [result];
   };
   if (!on && window()?.platform === "windows") return windowsDirectory();
-  const script = 'n=0; for p in "$1"/* "$1"/.[!.]* "$1"/..?*; do [ -e "$p" ] || [ -L "$p" ] || continue; name=${p##*/}; [ "$name" = .git ] && continue; if [ -d "$p" ]; then kind=d; else kind=f; fi; printf "%s\\0%s\\0" "$kind" "$name"; n=$((n+1)); [ "$n" -gt 500 ] && break; done; test -d "$1"';
+  // 2 = missing, 3 = unreadable, 4 = a file. `stat` has two dialects: GNU (Linux, and
+  // a remote machine) takes -c, the BSD one on macOS takes -f; probed once per listing
+  // rather than once per entry.
+  const script = 'd=$1; [ -e "$d" ] || [ -L "$d" ] || exit 2; [ -d "$d" ] || exit 4; '
+    + '{ [ -r "$d" ] && [ -x "$d" ]; } || exit 3; '
+    + 'if stat -c %Y / >/dev/null 2>&1; then G=1; else G=0; fi; n=0; '
+    + 'for p in "$d"/* "$d"/.[!.]* "$d"/..?*; do [ -e "$p" ] || [ -L "$p" ] || continue; name=${p##*/}; '
+    + '[ "$name" = .git ] && continue; if [ -d "$p" ]; then kind=d; else kind=f; fi; '
+    + 'if [ $G -eq 1 ]; then set -- $(stat -c \'%Y %s\' "$p" 2>/dev/null); else set -- $(stat -f \'%m %z\' "$p" 2>/dev/null); fi; '
+    + 'mt=${1:-0}; if [ "$kind" = d ]; then sz=0; else sz=${2:-0}; fi; '
+    + 'printf "%s\\0%s\\0%s\\0%s\\0" "$kind" "$name" "$mt" "$sz"; '
+    + 'n=$((n+1)); [ "$n" -gt 500 ] && break; done';
   let r;
   try { r = await exec("sh", ["-c", script, "files", path], { on }); }
   catch (e) {
     if (on && String(e).includes("cannot start sh: program not found")) return windowsDirectory();
     throw e;
   }
-  if (r.code !== 0) throw new Error(r.stderr || "Cannot list this folder");
+  if (r.code === 2) throw folderError("missing", "Not found");
+  if (r.code === 3) throw folderError("denied", "Permission denied");
+  if (r.code === 4) throw folderError("notdir", "Not a folder");
+  if (r.code !== 0) throw folderError(null, r.stderr || "Cannot list this folder");
   const fields = r.stdout.split("\0"), out = [];
-  for (let i = 0; i + 1 < fields.length; i += 2) out.push({ name: fields[i + 1], dir: fields[i] === "d" });
+  for (let i = 0; i + 3 < fields.length; i += 4) {
+    out.push({ name: fields[i + 1], dir: fields[i] === "d", ms: Number(fields[i + 2]) * 1000 || 0, size: Number(fields[i + 3]) || 0 });
+  }
   return out;
 }
 
 export default class Files extends View {
   init(_props, cx) {
-    // The same mod draws its context menu as a popup; that copy holds no file tree.
-    if (props()?.fileMenu) return;
+    // The same mod draws its context and column menus as popups; those copies hold
+    // no file tree of their own.
+    if (props()?.fileMenu || props()?.colMenu) return;
     this.saved = new Map();
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
+    // When this view appeared: a menu's note is left in shared state, and a view that
+    // starts later must not act on one an earlier view was asked to do.
+    this.bornAt = Date.now();
+    // Sort lives on the view, not on the listing: a refresh, a jump or a walk up the
+    // tree re-lists entries but keeps the order the person chose. A layout may pick a
+    // starting order with `"props": {"sort": "date", "sortDesc": true}`.
+    this.sortKey = SORT_FIELDS.includes(props()?.sort) ? props().sort : "name";
+    this.sortDesc = typeof props()?.sortDesc === "boolean" ? props()?.sortDesc : false;
+    // Which of the three value columns are on screen, and in what order. Name is the
+    // row itself, so it is always first; the rest come from config.json.
+    this.colOrder = COL_DEFS.slice();
+    this.colHidden = new Set();
+    this.loadCols(cx);
     // The header path doubles as an address bar: click it, type, Enter.
     this.editing = false;
     this.input = InputState.new({ placeholder: "path — Enter to go, empty Enter to cancel" });
@@ -377,14 +505,121 @@ export default class Files extends View {
     return this.context === context && key() === context.key;
   }
 
+  // Folders first, then the chosen field, then the name — the one order every path
+  // through this view uses, so a fresh listing and a re-sort agree.
+  sorted(list) {
+    const key = SORT_FIELDS.includes(this.sortKey) ? this.sortKey : "name";
+    const sign = this.sortDesc ? -1 : 1;
+    return list.slice().sort((a, b) => {
+      if (a.dir !== b.dir) return a.dir ? -1 : 1;
+      const c = compareBy(key, a, b);
+      return c ? c * sign : nlCompare(a.name, b.name);
+    });
+  }
+
+  // Re-order what is already in hand: no second listing for a header click.
+  resortAll() {
+    for (const [p, list] of this.entries) this.entries.set(p, this.sorted(list));
+  }
+
+  // The column header is the whole control: sort by it, or reverse what it already did.
+  setSort(key, cx) {
+    if (this.sortKey === key) this.sortDesc = !this.sortDesc;
+    else { this.sortKey = key; this.sortDesc = false; }
+    this.resortAll();
+    cx.notify();
+  }
+
+  // Which value columns show, and in what order — `{"columns": ["size","date"],
+  // "hiddenColumns": ["type"]}` in config.json, so it survives a restart.
+  async loadCols(cx) {
+    const cfg = await readConfig();
+    const order = (Array.isArray(cfg?.columns) ? cfg.columns : []).filter(k => COL_DEFS.includes(k));
+    for (const k of COL_DEFS) if (!order.includes(k)) order.push(k);
+    const hidden = (Array.isArray(cfg?.hiddenColumns) ? cfg.hiddenColumns : []).filter(k => COL_DEFS.includes(k));
+    this.colOrder = order;
+    this.colHidden = new Set(hidden);
+    cx.notify();
+  }
+
+  async saveCols() {
+    try {
+      const before = (await readTextFile(CONFIG_FILE)) ?? null;
+      const cfg = before ? (JSON.parse(before) ?? {}) : {};
+      cfg.columns = this.colOrder;
+      cfg.hiddenColumns = [...this.colHidden];
+      await writeTextFile(CONFIG_FILE, JSON.stringify(cfg, null, 2) + "\n", before);
+    } catch {}
+  }
+
+  visibleCols() {
+    return this.colOrder.filter(k => !this.colHidden.has(k));
+  }
+
+  toggleCol(key, cx) {
+    if (this.colHidden.has(key)) this.colHidden.delete(key);
+    else this.colHidden.add(key);
+    this.saveCols();
+    cx.notify();
+  }
+
+  // Move one column past its visible neighbour. The hidden ones keep their relative
+  // order at the tail, so showing one later puts it back among the columns, not after.
+  moveCol(key, dir, cx) {
+    const vis = this.visibleCols(), i = vis.indexOf(key), j = i + (dir < 0 ? -1 : 1);
+    if (i < 0 || j < 0 || j >= vis.length) return;
+    const swap = vis[i];
+    vis[i] = vis[j]; vis[j] = swap;
+    this.colOrder = [...vis, ...this.colOrder.filter(k => this.colHidden.has(k))];
+    this.saveCols();
+    cx.notify();
+  }
+
+  colMenu(cx) {
+    openOverlay({
+      mod: "files-open", kind: "popup", at: "pointer", width: 214,
+      props: { colMenu: { cols: this.visibleCols(), hidden: [...this.colHidden], key: this.sortKey } },
+    });
+    cx.notify();
+  }
+
+  // One menu for both jobs: ✓ shows or hides a column, ← → moves it. Name is the row
+  // itself, so it stays: no ✓ and no arrows on its line.
+  renderColMenu(t) {
+    const m = props()?.colMenu;
+    if (!m) return div();
+    const vis = m.cols ?? [];
+    const row = (k) => {
+      const fixed = k === "name", shown = fixed || vis.includes(k), at = vis.indexOf(k);
+      const arrow = (glyph, dir, off) => div().w(15).flex_none().text_center().text_size(12)
+        .text_color(off ? t.border : t.muted)
+        .when(!off, el => el.cursor_pointer().hover(s => s.text_color(t.foreground))
+          .on_click((_e, _cx) => { this.ask({ what: "colmove", key: k, dir }); closeOverlay(props().overlay); }))
+        .child(glyph);
+      return h_flex().id(`fc-${k}`).h(28).px(6).rounded(7).gap(1).items_center().cursor_pointer()
+        .when(k === m.key, el => el.bg(t.selected))
+        .hover(el => el.bg(k === m.key ? t.selected : t.hover))
+        .child(div().w(16).flex_none().text_center().text_size(11).text_color(shown ? t.ansi2 : t.border)
+          .when(!fixed, el => el.on_click((_e, _cx) => { this.ask({ what: "coltoggle", key: k }); closeOverlay(props().overlay); }))
+          .child(shown ? "✓" : "·"))
+        .child(div().flex_1().min_w(0).truncate().text_color(shown ? t.foreground : t.dim).child(COL_LABEL[k]))
+        .when(!fixed, el => el.child(arrow("←", -1, at <= 0)).child(arrow("→", 1, at < 0 || at === vis.length - 1)));
+    };
+    return v_flex().id("files-col-menu").w_full().p(4).bg(t.popover).text_color(t.foreground).text_size(12.5)
+      .child(div().px(7).pt(3).pb(5).text_size(11).text_color(t.dim).child("Columns · ✓ shows, ← → moves"))
+      .children(["name", ...COL_DEFS].map(row));
+  }
+
   async loadFolder(path, context) {
     const { on, cwd: root } = context;
     const entries = await directory(path ? `${root}/${path}` : root, on);
     if (!this.current(context) || (path && !this.folders.has(path))) return;
     const used = [...this.entries.entries()].filter(([p]) => p !== path).reduce((n, [, e]) => n + e.length, 0);
-    this.entries.set(path, sortEntries(entries.slice(0, Math.max(0, Math.min(PER_FOLDER, TOTAL - used)))));
+    // Sorted first, then cut: the entries kept are the first ones as displayed.
+    this.entries.set(path, this.sorted(entries).slice(0, Math.max(0, Math.min(PER_FOLDER, TOTAL - used))));
     if (entries.length > PER_FOLDER || used + entries.length > TOTAL) this.limited = true;
   }
+
 
   refresh(cx) {
     const { cwd, on } = location(), next = key();
@@ -408,7 +643,7 @@ export default class Files extends View {
           if (!this.current(context)) return;
           await this.loadFolder(path, context);
         }
-      } catch (e) { if (this.current(context)) this.error = String(e); }
+      } catch (e) { if (this.current(context)) this.error = errText(e, this.root); }
       finally { if (this.context === context) this.loading = false; cx.notify(); }
     });
     this.watch(this.root ?? cwd, cx);
@@ -423,7 +658,7 @@ export default class Files extends View {
       this.pending.add(path);
       cx.spawn(async cx => {
         try { await this.loadFolder(path, context); }
-        catch (e) { if (this.current(context)) this.error = String(e); }
+        catch (e) { if (this.current(context)) { this.status = errText(e, `${this.root}/${path}`); this.failed = true; this.fade(cx); } }
         finally { this.pending.delete(path); cx.notify(); }
       });
     }
@@ -434,43 +669,89 @@ export default class Files extends View {
   // file moves to its folder and previews it, since that is what a pasted path means.
   beginJump(cx) {
     this.input.set_value(this.file ? `${this.root}/${this.file}` : this.root ?? "");
+    // Starting from the current path and selected, so typing replaces it and Enter
+    // without typing is a no-op.
+    this.input.set_selected_range({ start: 0, end: this.input.value().length });
     this.editing = true;
     this.input.focus();
     cx.notify();
   }
 
-  jumpTo(text, cx) {
-    const target = resolvePath(text, this.root);
+  // `~` means the home of the machine the panel is looking at, so a remote panel asks
+  // that machine once and remembers the answer instead of pasting this computer's home
+  // onto a path the far side will never have. Asked through the same channel the
+  // listings use, so `~` lands where a listing would (a container's home can differ
+  // from the one `ssh` reports).
+  async remoteHome(on) {
+    if (!on) return home();
+    if (!this.homes) this.homes = new Map();
+    if (this.homes.has(on)) return this.homes.get(on);
+    try {
+      const r = await exec("sh", ["-c", 'printf %s "$HOME"'], { on });
+      const h = (r.stdout || "").trim();
+      if (h) this.homes.set(on, h);
+      return h || null;
+    } catch { return null; }
+  }
+
+  jumpTo(text, cx, opts = {}) {
     this.editing = false;
-    if (!target || target === this.root) { cx.notify(); return; }
     const context = this.context, on = this.on;
     const land = (root, file, entries) => {
       this.context = { ...context, cwd: root };
       this.root = root;
       this.folders = new Set(); this.pending = new Set(); this.marks = {};
-      this.selected = null; this.selectedDir = null;
-      this.entries = new Map([["", sortEntries(entries.slice(0, PER_FOLDER))]]);
-      this.watched = null; this.error = null; this.status = null;
+      this.selected = opts.expand ?? null; this.selectedDir = opts.expand ? true : null;
+      this.entries = new Map([["", this.sorted(entries).slice(0, PER_FOLDER)]]);
+      this.watched = null; this.error = null; this.status = null; this.failed = false;
       this.limited = entries.length > PER_FOLDER;
       this.show(file ?? null, cx);
       this.watch(root, cx);
+      // Walking up from a folder re-opens the one just left, so the move is visible.
+      if (opts.expand) this.toggle(opts.expand, cx);
     };
-    this.status = null;
+    this.status = null; this.failed = false;
     cx.spawn(async cx => {
+      let raw = String(text ?? "");
+      if (/^\s*~(?=$|[\\/])/.test(raw)) {
+        const h = await this.remoteHome(on);
+        if (!this.current(context)) return;
+        if (!h) { this.status = "Cannot resolve ~ on this machine"; this.failed = true; this.fade(cx); cx.notify(); return; }
+        raw = raw.replace(/^\s*~/, h);
+      }
+      const target = resolvePath(raw, this.root);
+      if (!target) { cx.notify(); return; }
+      if (target === this.root) { this.status = null; this.failed = false; cx.notify(); return; }
       try {
         const entries = await directory(target, on);
         if (!this.current(context)) return;
         land(target, null, entries);
-      } catch {
-        const cut = target.replace(/[\\/][^\\/]*$/, "");
-        const name = target.split("/").pop();
+      } catch (e) {
+        // A path to a file is a reasonable thing to paste: land on its folder and
+        // preview it. A folder that refused to list stays the error it was.
+        const cut = target.replace(/[\\/][^\\/]*$/, ""), name = target.split("/").pop();
         let entries = null;
         if (cut && cut !== target) { try { entries = await directory(cut, on); } catch {} }
         if (!this.current(context)) return;
-        if (entries?.some(x => !x.dir && x.name === name)) land(cut, name, entries);
-        else this.status = `Not a folder: ${target}`;
+        const hit = entries?.find(x => x.name === name);
+        if (hit && !hit.dir) land(cut, name, entries);
+        else { this.status = errText(e, target); this.failed = true; this.fade(cx); }
       } finally { cx.notify(); }
     });
+  }
+
+  // Walk into a folder: it becomes the root of the tree, and ↑ leads back out. A
+  // relative path, so it is read against the folder on screen like any typed name.
+  enter(path, cx) {
+    this.jumpTo(path, cx);
+  }
+
+  // One level up, with the folder just left re-opened and selected. At a drive root
+  // or `/` there is nowhere to go, and it says so rather than doing nothing.
+  goUp(cx) {
+    const up = parentOf(this.root);
+    if (!up) { this.status = `Already at the top: ${this.root}`; this.failed = true; cx.notify(); this.fade(cx); return; }
+    this.jumpTo(up, cx, { expand: base(this.root) });
   }
 
   // `name` while the tree sits on the pane's own folder, `…/name` once it has been
@@ -488,12 +769,14 @@ export default class Files extends View {
     const label = this.copied
       ? `✓ ${this.copied.split(/[\\/]/).pop() || this.copied}`
       : this.file ?? this.rootLabel();
-    return div().id("files-path").flex_1().min_w(0).truncate().text_right().text_size(12)
-      .text_color(this.copied ? t.ansi2 : t.dim).cursor_pointer()
-      .hover(s => s.text_color(t.foreground))
+    // Drawn as a field, not as a label: the border is the hint that this is where a
+    // path can be typed. Right-click copies it instead.
+    return h_flex().id("files-path").flex_1().min_w(0).h(24).px(7).items_center().justify_end().rounded(6)
+      .border_1().border_color(t.border).bg(t.background).cursor_pointer()
+      .hover(s => s.border_color(t.accent).text_color(t.foreground))
       .on_click((_e, cx) => this.beginJump(cx))
       .on_mouse_down("right", (_e, cx) => this.copyPath(this.file ?? "", cx))
-      .child(label);
+      .child(div().min_w(0).truncate().text_size(12).text_color(this.copied ? t.ansi2 : t.dim).child(label));
   }
 
   // Hand the file to the OS: local paths straight away, remote ones after an scp.
@@ -676,6 +959,7 @@ export default class Files extends View {
   takeIntent(cx) {
     const it = shared("files-open.intent");
     if (!it?.at || it.at === this.intentAt || !this.root) return;
+    if (it.at < (this.bornAt ?? 0)) { this.intentAt = it.at; return; }
     this.intentAt = it.at;
     const path = it.path ?? "";
     if (it.what === "preview") this.show(path, cx);
@@ -685,6 +969,8 @@ export default class Files extends View {
     else if (it.what === "downloadto") this.download(path, cx, true);
     else if (it.what === "upload") this.startUpload(cx, path);
     else if (it.what === "copy") this.copyPath(path, cx);
+    else if (it.what === "coltoggle" && COL_DEFS.includes(it.key)) this.toggleCol(it.key, cx);
+    else if (it.what === "colmove" && COL_DEFS.includes(it.key)) this.moveCol(it.key, it.dir, cx);
   }
 
   fade(cx) {
@@ -741,8 +1027,34 @@ export default class Files extends View {
     });
   }
 
+  // A table header: the columns the rows are made of, and the place a click sorts by —
+  // clicking the column already sorted reverses it. The ⋮ sits first, before the name,
+  // because the name is the one cell that flexes: put it last and every column would
+  // shift left by its width and stop lining up with the values under it.
+  headerRow(t) {
+    const active = (k) => this.sortKey === k;
+    const col = (k, label, w, right = false) => {
+      const cell = h_flex().id(`files-col-${k}`).h_full().flex_none().items_center().gap(3).truncate().cursor_pointer()
+        .text_size(10.5).text_color(active(k) ? t.accent : t.dim)
+        .hover(s => s.text_color(t.foreground))
+        .on_click((_e, cx) => this.setSort(k, cx))
+        .on_mouse_down("right", (_e, cx) => this.colMenu(cx))
+        .when(right, el => el.justify_end())
+        .child(div().truncate().child(label))
+        .when(active(k), el => el.child(div().text_size(8).child(this.sortDesc ? "▼" : "▲")));
+      return w ? cell.w(w) : cell.flex_1().min_w(0);
+    };
+    return h_flex().id("files-head").flex_none().h(21).px(14).gap(7).items_center().border_b(1).border_color(t.border)
+      .child(div().id("files-cols").flex_none().w(14).text_center().cursor_pointer().text_size(12).text_color(t.muted)
+        .hover(s => s.text_color(t.foreground)).on_click((_e, cx) => this.colMenu(cx)).child("⋮"))
+      .child(col("name", COL_LABEL.name))
+      .children(this.visibleCols().map(k => col(k, COL_LABEL[k], COL_W[k], k === "size")));
+  }
+
   rows(prefix, depth, out, t) {
     if (out.length >= TOTAL || depth > 40) return out;
+    const cell = (w, text, right = false) => h_flex().flex_none().h_full().items_center().w(w).when(right, el => el.justify_end())
+      .child(div().truncate().text_size(10.5).text_color(t.dim).child(text));
     for (const entry of this.entries.get(prefix) ?? []) {
       if (out.length >= TOTAL) break;
       const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[`${this.root}/${path}`];
@@ -753,7 +1065,9 @@ export default class Files extends View {
         .hover(s => s.bg(chosen ? t.selected : t.hover))
         .on_click((e, cx) => {
           this.selected = path; this.selectedDir = entry.dir;
-          if (entry.dir) { this.toggle(path, cx); return; }
+          // A single click on a folder opens it in place; a double click walks into
+          // it — the same gesture as a file manager, and ↑ leads back out.
+          if (entry.dir) { if (e.click_count >= 2) this.enter(path, cx); else this.toggle(path, cx); return; }
           if (e.click_count >= 2) this.handOff(path, cx);
           else if (!external) this.show(path, cx);
           else cx.notify();
@@ -762,8 +1076,11 @@ export default class Files extends View {
         .child(entry.dir ? svg(`mods/files-open/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
         .child(image(iconSvg(entry.dir ? (open ? "folder-open" : "folder") : iconOf(entry.name))).w(15).h(15).flex_none())
         .child(div().flex_1().min_w(0).truncate().when(copied, el => el.text_color(t.ansi2).child("✓ ")).child(entry.name))
+        // Badges sit before the value columns: anything after them would push those
+        // columns left and break the alignment with the header.
         .when(external, el => el.child(div().text_size(10).text_color(t.dim).child("↗")))
-        .when(Boolean(mark), el => el.child(div().text_size(11).text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked).child(mark))));
+        .when(Boolean(mark), el => el.child(div().text_size(11).text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked).child(mark)))
+        .children(this.visibleCols().map(k => cell(COL_W[k], colText(entry, k), k === "size"))));
       if (entry.dir && open) this.rows(path, depth + 1, out, t);
     }
     return out;
@@ -772,6 +1089,7 @@ export default class Files extends View {
   render(cx) {
     const t = theme();
     if (props()?.fileMenu) return this.renderMenu(t);
+    if (props()?.colMenu) return this.renderColMenu(t);
     if (key() !== this.context?.key) this.refresh(cx);
     return v_flex().id("files").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
       .on_drop((event, cx) => this.upload(event.paths, cx, this.selectedDir ? this.selected ?? "" : ""))
@@ -782,16 +1100,23 @@ export default class Files extends View {
         .when(Boolean(this.baseCwd) && this.root !== this.baseCwd, el => el.child(div().id("files-home").px(3).cursor_pointer()
           .text_color(t.muted).hover(s => s.text_color(t.foreground))
           .on_click((_e, cx) => this.jumpTo(this.baseCwd, cx)).child("↩")))
+        .when(!this.file, el => el.child(div().id("files-up").px(3).cursor_pointer()
+          .text_color(parentOf(this.root) ? t.muted : t.border).hover(s => s.text_color(t.foreground))
+          .on_click((_e, cx) => this.goUp(cx)).child("↑")))
         .child(this.pathLine(t, cx))
-        .when(!this.file, el => el.child(div().id("files-upload").px(3).cursor_pointer().text_color(t.muted).hover(s => s.text_color(t.foreground))
-          .on_click((_e, cx) => this.startUpload(cx)).child(svg("mods/files-open/upload-arrow.svg").size(15))))
+        .when(!this.file, el => el.child(div().id("files-upload").px(4).cursor_pointer().text_size(11.5)
+          .text_color(t.muted).hover(s => s.text_color(t.foreground))
+          .on_click((_e, cx) => this.startUpload(cx)).child("Upload")))
         .when(Boolean(this.file), el => el.child(div().id("files-open-ext").px(6).cursor_pointer().text_color(t.muted).hover(s => s.text_color(t.foreground))
           .on_click((_e, cx) => this.handOff(this.file, cx)).child("↗"))))
       .when(Boolean(this.status || this.hint), el => el.child(div().px(12).py(5).flex_none().border_b(1).border_color(t.border).text_size(11)
         .text_color(this.failed ? t.ansi1 : t.dim).truncate().child(this.status || this.hint)))
       .when(Boolean(this.job), el => el.child(this.jobRow(t)))
+      .when(!this.file && Boolean(this.entries.get("")?.length), el => el.child(this.headerRow(t)))
       .when(!this.file, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.rows("", 0, [], t))
-        .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))))
+        .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().id("files-empty").p(8).text_size(12)
+          .text_color(this.error ? t.ansi1 : t.dim)
+          .child(this.error || (this.loading ? "Loading files…" : !this.root ? "No folder" : "This folder is empty"))))
         .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total")))))
       .when(Boolean(this.file), el => el.child(
         this.md != null
