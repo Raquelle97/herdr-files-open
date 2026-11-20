@@ -4,8 +4,9 @@
 // panel uploaded into the folder shown, and double-click opening with the OS app.
 //
 // A lazy file browser for the focused pane's folder, with bounded read-only previews.
-// Files the editor can't preview (html, pdf, images, office, archives) open with the
+// Files the editor can't preview (pdf, images, office, archives) open with the
 // system default app instead — locally at once, or after downloading from that machine.
+// html is drawn as a page, not as source in the text editor.
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView, Input, InputState } from "gpui-base";
 import { spaces, panes, focused, exec, readTextFile, writeTextFile, watchFolder, theme, settings, window, home, appHome, notify,
@@ -13,7 +14,7 @@ import { spaces, panes, focused, exec, readTextFile, writeTextFile, watchFolder,
 
 // Extensions that are far better in a real viewer than as syntax-highlighted text.
 const EXTERNAL = new Set([
-  "html", "htm", "xhtml", "pdf",
+  "pdf",
   "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "tif", "tiff", "avif", "heic",
   "mp4", "webm", "mov", "mkv", "mp3", "wav", "flac", "ogg",
   "docx", "doc", "xlsx", "xls", "pptx", "ppt", "odt", "ods", "odp", "rtf", "epub",
@@ -21,9 +22,11 @@ const EXTERNAL = new Set([
 ]);
 // Rendered by TextView instead of a code editor.
 const MARKDOWN = new Set(["md", "markdown", "mdx", "rst"]);
+const HTML = new Set(["html", "htm", "xhtml"]);
 const extOf = (p) => (p.includes(".") ? p.split(".").pop().toLowerCase() : "");
 const isExternal = (p) => EXTERNAL.has(extOf(p));
 const isMarkdown = (p) => MARKDOWN.has(extOf(p));
+const isHtml = (p) => HTML.has(extOf(p));
 const base = (p) => String(p).split(/[\\/]/).filter(Boolean).pop() ?? "";
 const platform = () => window()?.platform;
 const winpath = (p) => (platform() === "windows" ? p.replace(/\//g, "\\") : p);
@@ -286,13 +289,131 @@ async function bytesUnder(path, on = null) {
 }
 
 
+// A transfer may run for minutes. Herdr's default exec limit is 30s, which kills a
+// large scp and used to be reported as success because the exit code was ignored.
+const TRANSFER_TIMEOUT = 600000;
+
+// `exec` resolves on a non-zero exit. Callers that copy a file have to look
+// themselves, or a failed scp still becomes "Downloaded to …".
+function commandText(r) {
+  const lines = String(r?.stderr || r?.stdout || "").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  // "Connection closed" is what scp prints after the real reason, usually
+  // "Permission denied". The line above it is the one that says why.
+  const useful = lines.filter(l => !/^scp: Connection closed$/i.test(l) && !/lost connection/i.test(l));
+  return (useful[0] || lines[0] || "").replace(/^scp:\s*/i, "");
+}
+
+function commandFailed(r, what) {
+  if (!r || r.code === 0) return;
+  const why = commandText(r);
+  throw new Error(why ? `${what}: ${why.slice(0, 180)}` : `${what} failed`);
+}
+
+// Batch scp cannot ask for a password. login02 and login07 are reached by
+// Herdr through its own command, not by this ssh config, so scp is refused
+// and then says the connection closed. Those still answer exec(..., { on }).
+function scpNeedsCore(r) {
+  const t = `${r?.stderr || ""}\n${r?.stdout || ""}`;
+  return /permission denied|connection closed|connection reset|connection refused|could not resolve|no route|network is unreachable|broken pipe/i.test(t);
+}
+
+async function localExists(path) {
+  if (platform() === "windows") {
+    const q = String(winpath(path)).replace(/'/g, "''");
+    const r = await exec("powershell", ["-NoProfile", "-Command",
+      `if (Test-Path -LiteralPath '${q}') { exit 0 } else { exit 1 }`]);
+    return r.code === 0;
+  }
+  const r = await exec("sh", ["-c", '[ -e "$1" ]', "exists", path]);
+  return r.code === 0;
+}
+
+const shellQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+
+// A file scp cannot log in to fetch, read through the same channel that
+// listed the folder. Bytes come back base64 so a binary file survives exec's
+// text pipe. Each piece stays under 1 MiB: that is writeTextFile's limit,
+// and base64 is a third larger than the bytes it carries.
+async function pullFileThrough(machine, remote, local) {
+  const q = shellQuote(remote);
+  const sizeR = await exec("sh", ["-c", `stat -c %s ${q}`], { on: machine, timeout: 60000 });
+  commandFailed(sizeR, "Download");
+  const size = parseInt(String(sizeR.stdout).trim(), 10);
+  if (!Number.isFinite(size) || size < 0) throw new Error("Download failed: cannot tell the file size");
+  const dest = winpath(local).replace(/'/g, "''");
+  const created = await exec("powershell", ["-NoProfile", "-Command",
+    `New-Item -ItemType File -Force -Path '${dest}' | Out-Null`]);
+  commandFailed(created, "Download");
+  const chunk = 512 * 1024;
+  const tmp = `${appHome()}/mods/files-open/.chunk.b64`;
+  for (let offset = 0; offset < size; offset += chunk) {
+    const r = await exec("sh", ["-c",
+      `dd if=${q} bs=${chunk} skip=${Math.floor(offset / chunk)} count=1 2>/dev/null | base64 | tr -d '\\n'`],
+      { on: machine, timeout: TRANSFER_TIMEOUT });
+    commandFailed(r, "Download");
+    const b64 = String(r.stdout || "").replace(/\s+/g, "");
+    if (!b64) throw new Error("Download failed: the file stopped arriving");
+    const expected = await readTextFile(tmp);
+    await writeTextFile(tmp, b64, expected);
+    const src = winpath(tmp).replace(/'/g, "''");
+    const mode = offset === 0 ? "Create" : "Append";
+    const ps = `$b = [IO.File]::ReadAllText('${src}').Trim(); `
+      + `$bytes = [Convert]::FromBase64String($b); `
+      + `$fs = [IO.File]::Open('${dest}', '${mode}'); `
+      + `$fs.Write($bytes, 0, $bytes.Length); $fs.Close()`;
+    const w = await exec("powershell", ["-NoProfile", "-Command", ps]);
+    commandFailed(w, "Download");
+  }
+  if (!(await localExists(local))) throw new Error(`Download failed: ${local} is not on this computer`);
+}
+
+async function pullThroughCore(machine, remote, local, recursive) {
+  if (!recursive) {
+    await pullFileThrough(machine, remote, local);
+    return;
+  }
+  const made = await exec("sh", ["-c",
+    `t=$(mktemp /tmp/herdr-dl-XXXXXX.tar 2>/dev/null || mktemp "$HOME/herdr-dl-XXXXXX.tar"); `
+    + `tar -cf "$t" -C ${shellQuote(remote.replace(/\/[^/]*$/, "") || "/")} -- ${shellQuote(remote.split("/").pop())}; `
+    + `printf %s "$t"`], { on: machine, timeout: TRANSFER_TIMEOUT });
+  commandFailed(made, "Download");
+  const tarRemote = String(made.stdout || "").trim().split(/\s+/).pop();
+  if (!tarRemote) throw new Error("Download failed: could not pack the folder");
+  const tarLocal = `${winpath(local)}.tar`;
+  try {
+    await pullFileThrough(machine, tarRemote, tarLocal);
+    await makeDir(local);
+    const extracted = await exec("tar", ["-xf", tarLocal, "-C", local, "--strip-components=1"], { timeout: TRANSFER_TIMEOUT });
+    commandFailed(extracted, "Download");
+  } finally {
+    await exec("sh", ["-c", `rm -f ${shellQuote(tarRemote)}`], { on: machine, timeout: 60000 });
+    await exec("powershell", ["-NoProfile", "-Command",
+      `Remove-Item -LiteralPath '${tarLocal.replace(/'/g, "''")}' -Force -ErrorAction SilentlyContinue`]);
+  }
+}
+
+// System scp first (`-r` only when the source is a folder). When that ssh
+// login is refused, read the file through Herdr's own connection instead.
+async function scpDown(machine, remote, local, recursive = false) {
+  const args = ["-B"];
+  if (recursive) args.push("-r");
+  args.push(`${machine}:${remote}`, String(local).replace(/\\/g, "/"));
+  const r = await exec("scp", args, { timeout: TRANSFER_TIMEOUT });
+  if (r.code === 0 && await localExists(local)) return;
+  if (scpNeedsCore(r)) {
+    await pullThroughCore(machine, remote, local, recursive);
+    return;
+  }
+  commandFailed(r, "Download");
+  if (!(await localExists(local))) throw new Error(`Download failed: ${local} is not on this computer`);
+}
+
 // Pull a remote file into the local download folder so the OS can open it.
 async function fetchHere(machine, remote, name) {
   const dir = await saveDir();
   await makeDir(dir);
   const local = `${dir}/${name}`;
-  // A machine's saved name is also its ~/.ssh/config Host, so scp resolves it the same way.
-  await exec("scp", ["-q", "-B", `${machine}:${remote}`, local]);
+  await scpDown(machine, remote, local);
   return local;
 }
 
@@ -331,26 +452,33 @@ async function copyInto(src, dir, dest) {
       + "if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null } "
       + "Copy-Item -LiteralPath $s -Destination $t -Force -Recurse; $t } '"
       + q(winpath(src)) + "' '" + q(winpath(to)) + "'";
-    const r = await exec("powershell", ["-NoProfile", "-Command", ps]);
-    return (r.stdout || "").trim() || winpath(to);
+    const r = await exec("powershell", ["-NoProfile", "-Command", ps], { timeout: TRANSFER_TIMEOUT });
+    commandFailed(r, "Download");
+    const landed = (r.stdout || "").trim() || winpath(to);
+    if (!(await localExists(landed))) throw new Error(`Download failed: ${landed} is not on this computer`);
+    return landed;
   }
   const script = 'd=${2%/*}; [ -d "$d" ] || mkdir -p "$d"; cp -Rp "$1" "$2"; printf %s "$2"';
-  const r = await exec("sh", ["-c", script, "cp", src, to]);
-  return (r.stdout || "").trim() || to;
+  const r = await exec("sh", ["-c", script, "cp", src, to], { timeout: TRANSFER_TIMEOUT });
+  commandFailed(r, "Download");
+  const landed = (r.stdout || "").trim() || to;
+  if (!(await localExists(landed))) throw new Error(`Download failed: ${landed} is not on this computer`);
+  return landed;
 }
 
 // scp a remote file or folder down to `dir`, never overwriting; returns the local path.
 async function pullInto(machine, remote, dir, dest) {
   const to = dest ?? await freeName(dir, base(remote));
   await makeDir(dir);
-  await exec("scp", ["-q", "-B", "-r", `${machine}:${remote}`, to]);
+  await scpDown(machine, remote, to, true);
   return to;
 }
 
 // scp a local file or folder up into a folder on `machine`, also without overwriting.
 async function pushUp(machine, local, remoteDir) {
   const dest = await freeNameRemote(machine, remoteDir, base(local));
-  await exec("scp", ["-q", "-B", "-r", local, `${machine}:${dest}`]);
+  const r = await exec("scp", ["-B", "-r", local, `${machine}:${dest}`], { timeout: TRANSFER_TIMEOUT });
+  commandFailed(r, "Upload");
   return dest;
 }
 
@@ -920,15 +1048,18 @@ export default class Files extends View {
         const full = `${root}/${path}`;
         const name = path.split("/").pop();
         const local = on ? await fetchHere(on, full, name) : full;
+        if (!(await localExists(local))) throw new Error(`${local} is not on this computer`);
         if (withChooser) await launchWith(local);
         else await launch(local);
         if (this.current(context)) {
+          this.failed = false;
+          this.statusTitle = null;
           this.status = on ? `Downloaded to ${local}` : (withChooser ? "Opened with the app you picked" : "Opened in the default app");
           this.hint = null;
         }
       } catch (e) {
-        if (this.current(context)) { this.status = `Cannot open: ${String(e)}`; this.hint = null; }
-      } finally { cx.notify(); this.fade(cx); }
+        if (this.current(context)) this.reportFailure("Open", e, on);
+      } finally { cx.notify(); this.fade(cx, this.failed ? 12000 : 4200); }
     });
   }
 
@@ -967,11 +1098,11 @@ export default class Files extends View {
         // the file is saved either way, and the bar shouldn't wait on a window.
         if (await revealWanted()) showInFileManager(saved);
       } catch (e) {
-        if (this.current(context)) this.status = `Download failed: ${String(e).split("\n")[0].slice(0, 160)}`;
+        if (this.current(context)) this.reportFailure("Download", e, on);
       } finally {
         // A second download started meanwhile owns the bar now; leave it alone.
         if (this.job === job) this.job = null;
-        cx.notify(); this.fade(cx);
+        cx.notify(); this.fade(cx, this.failed ? 12000 : 4200);
       }
     });
   }
@@ -1034,9 +1165,8 @@ export default class Files extends View {
         }
       } catch (e) {
         if (this.current(context)) {
-          this.failed = true;
-          const why = String(e).split("\n")[0].slice(0, 160);
-          this.status = `Upload failed after ${done.length}/${total}: ${why}`;
+          this.reportFailure("Upload", e, on);
+          if (done.length) this.status = `Stopped after ${done.length} of ${total}. ${this.status}`;
         }
       } finally {
         this.hint = null; this.job = null;
@@ -1104,14 +1234,34 @@ export default class Files extends View {
     else if (it.what === "colmove" && COL_DEFS.includes(it.key)) this.moveCol(it.key, it.dir, cx);
   }
 
-  fade(cx) {
+  fade(cx, ms = 4200) {
     const at = Date.now();
     this.statusAt = at;
-    cx.timer.after(4200, (acx) => { if (this.statusAt === at) { this.status = null; acx.notify(); } });
+    cx.timer.after(ms, (acx) => { if (this.statusAt === at) { this.status = null; this.statusTitle = null; acx.notify(); } });
+  }
+
+  // Failures used to be one dim, truncated line under the path, gone in a few
+  // seconds. A lost connection needs the red bar and a toast, or it reads as
+  // nothing having happened.
+  reportFailure(action, e, machine) {
+    const detail = String(e?.message || e || "Unknown error")
+      .replace(/^Error:\s*/i, "")
+      .replace(/^(Download|Upload):\s*/i, "")
+      .replace(/^scp:\s*/i, "")
+      .trim()
+      .split(/\r?\n/)[0]
+      .slice(0, 200);
+    const lost = /connection closed|connection reset|timed out|connection refused|no route|could not resolve|network is unreachable|broken pipe/i.test(detail);
+    const title = lost && machine ? `${action} failed · lost connection to ${machine}` : `${action} failed`;
+    this.failed = true;
+    this.hint = null;
+    this.statusTitle = title;
+    this.status = detail || title;
+    notify({ title, body: detail && detail !== title ? detail : undefined, level: "error", timeout: 12000 });
   }
 
   show(path, cx) {
-    this.code?.release(); this.code = null; this.md = null;
+    this.code?.release(); this.code = null; this.md = null; this.html = null;
     this.file = path; this.fileError = null; this.hint = null;
     if (!path || !cx) return;
     const context = this.context, root = this.root, on = this.on;
@@ -1128,6 +1278,7 @@ export default class Files extends View {
         if (text === null) { this.fileError = "This file is no longer available"; return; }
         if (text.includes("\0")) { this.fileError = "Binary file · no text preview"; return; }
         if (isMarkdown(path)) { this.md = text.length > 400000 ? text.slice(0, 400000) + "\n\n… (file truncated)" : text; return; }
+        if (isHtml(path)) { this.html = text.length > 400000 ? text.slice(0, 400000) + "\n\n… (file truncated)" : text; return; }
         const t = theme(), ext = path.includes(".") ? path.split(".").pop() : "txt";
         this.code = EditorState.new({ language: LANG[ext] ?? ext, readonly: true,
           value: text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text,
@@ -1336,8 +1487,12 @@ export default class Files extends View {
         .when(Boolean(this.file), el => el.child(div().id("files-open-ext").px(6).cursor_pointer().text_color(t.muted).hover(s => s.text_color(t.foreground))
           .on_click((_e, cx) => this.handOff(this.file, cx)).child("↗"))))
       .when(Boolean(this.update), el => el.child(this.renderUpdate(t, cx)))
-      .when(Boolean(this.status || this.hint), el => el.child(div().px(12).py(5).flex_none().border_b(1).border_color(t.border).text_size(11)
-        .text_color(this.failed ? t.ansi1 : t.dim).truncate().child(this.status || this.hint)))
+      .when(Boolean(this.status || this.hint), el => el.child(this.failed
+        ? v_flex().id("files-failure").px(12).py(8).gap(2).flex_none().border_b(2).border_color(t.ansi1).bg(t.raised)
+            .child(div().text_size(13).font_semibold().text_color(t.ansi1).child(this.statusTitle || "Failed"))
+            .child(div().text_size(12).text_color(t.foreground).child(this.status || this.hint))
+        : div().px(12).py(5).flex_none().border_b(1).border_color(t.border).text_size(11)
+            .text_color(t.dim).truncate().child(this.status || this.hint)))
       .when(Boolean(this.job), el => el.child(this.jobRow(t)))
       .when(!this.file && Boolean(this.entries.get("")?.length), el => el.child(this.headerRow(t)))
       .when(!this.file, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.rows("", 0, [], t))
@@ -1346,7 +1501,10 @@ export default class Files extends View {
           .child(this.error || (this.loading ? "Loading files…" : !this.root ? "No folder" : "This folder is empty"))))
         .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total")))))
       .when(Boolean(this.file), el => el.child(
-        this.md != null
+        this.html != null
+          ? div().id("files-html").flex_1().min_h(0).overflow_y_scrollbar()
+              .child(TextView.html(`files-html:${this.file}`, this.html).selectable(true).scrollable(true))
+          : this.md != null
           ? div().id("files-md").flex_1().min_h(0).overflow_y_scrollbar().px(14).py(10).text_size(13)
               .child(TextView.markdown(`files-md:${this.file}`, this.md).selectable(true).scrollable(true))
           : this.code ? Editor.new(this.code).flex_1().min_h(0)
