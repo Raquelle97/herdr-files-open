@@ -334,7 +334,7 @@ const shellQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 // listed the folder. Bytes come back base64 so a binary file survives exec's
 // text pipe. Each piece stays under 1 MiB: that is writeTextFile's limit,
 // and base64 is a third larger than the bytes it carries.
-async function pullFileThrough(machine, remote, local) {
+async function pullFileThrough(machine, remote, local, token) {
   const q = shellQuote(remote);
   const sizeR = await exec("sh", ["-c", `stat -c %s ${q}`], { on: machine, timeout: 60000 });
   commandFailed(sizeR, "Download");
@@ -347,6 +347,7 @@ async function pullFileThrough(machine, remote, local) {
   const chunk = 512 * 1024;
   const tmp = `${appHome()}/mods/files-open/.chunk.b64`;
   for (let offset = 0; offset < size; offset += chunk) {
+    if (token?.stopped) throw new Error("Stopped");
     const r = await exec("sh", ["-c",
       `dd if=${q} bs=${chunk} skip=${Math.floor(offset / chunk)} count=1 2>/dev/null | base64 | tr -d '\\n'`],
       { on: machine, timeout: TRANSFER_TIMEOUT });
@@ -367,9 +368,19 @@ async function pullFileThrough(machine, remote, local) {
   if (!(await localExists(local))) throw new Error(`Download failed: ${local} is not on this computer`);
 }
 
-async function pullThroughCore(machine, remote, local, recursive) {
-  if (!recursive) {
-    await pullFileThrough(machine, remote, local);
+async function pullThroughCore(machine, remote, local, recursive, token) {
+  if (token?.stopped) throw new Error("Stopped");
+  // A single file packed as a tar and extracted with --strip-components=1
+  // loses its only path piece, so the destination is left an empty folder.
+  // Ask the machine: only a real directory takes the pack path.
+  let isDir = false;
+  if (recursive) {
+    const kind = await exec("sh", ["-c", `[ -d ${shellQuote(remote)} ] && echo dir || echo file`], { on: machine, timeout: 60000 });
+    commandFailed(kind, "Download");
+    isDir = String(kind.stdout || "").includes("dir");
+  }
+  if (!isDir) {
+    await pullFileThrough(machine, remote, local, token);
     return;
   }
   const made = await exec("sh", ["-c",
@@ -381,7 +392,7 @@ async function pullThroughCore(machine, remote, local, recursive) {
   if (!tarRemote) throw new Error("Download failed: could not pack the folder");
   const tarLocal = `${winpath(local)}.tar`;
   try {
-    await pullFileThrough(machine, tarRemote, tarLocal);
+    await pullFileThrough(machine, tarRemote, tarLocal, token);
     await makeDir(local);
     const extracted = await exec("tar", ["-xf", tarLocal, "-C", local, "--strip-components=1"], { timeout: TRANSFER_TIMEOUT });
     commandFailed(extracted, "Download");
@@ -392,16 +403,37 @@ async function pullThroughCore(machine, remote, local, recursive) {
   }
 }
 
+// End the copy the bar is showing. scp keeps running after the script moves on,
+// so Stop has to kill that process, not only forget the progress row. The child
+// ssh is in the same tree. The search is the destination path, which the Stop
+// script itself does not put in a Copy-Item or scp command.
+async function killTransfer(dest) {
+  if (!dest) return;
+  const needle = String(dest).replace(/\\/g, "/");
+  if (platform() === "windows") {
+    const n = needle.replace(/'/g, "''");
+    const ps = "$n='" + n + "'; "
+      + "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -like ('*' + $n + '*') -and ("
+      + "$_.Name -eq 'scp.exe' -or ($_.Name -eq 'powershell.exe' -and $_.CommandLine -like '*Copy-Item*')) } | "
+      + "ForEach-Object { & taskkill.exe /PID $_.ProcessId /T /F | Out-Null }";
+    try { await exec("powershell", ["-NoProfile", "-Command", ps]); } catch {}
+    return;
+  }
+  try { await exec("sh", ["-c", "pkill -f -- \"$1\" || true", "kill", needle]); } catch {}
+}
+
 // System scp first (`-r` only when the source is a folder). When that ssh
 // login is refused, read the file through Herdr's own connection instead.
-async function scpDown(machine, remote, local, recursive = false) {
+async function scpDown(machine, remote, local, recursive = false, token = null) {
+  if (token?.stopped) throw new Error("Stopped");
   const args = ["-B"];
   if (recursive) args.push("-r");
   args.push(`${machine}:${remote}`, String(local).replace(/\\/g, "/"));
   const r = await exec("scp", args, { timeout: TRANSFER_TIMEOUT });
+  if (token?.stopped) throw new Error("Stopped");
   if (r.code === 0 && await localExists(local)) return;
   if (scpNeedsCore(r)) {
-    await pullThroughCore(machine, remote, local, recursive);
+    await pullThroughCore(machine, remote, local, recursive, token);
     return;
   }
   commandFailed(r, "Download");
@@ -467,10 +499,10 @@ async function copyInto(src, dir, dest) {
 }
 
 // scp a remote file or folder down to `dir`, never overwriting; returns the local path.
-async function pullInto(machine, remote, dir, dest) {
+async function pullInto(machine, remote, dir, dest, token, recursive = false) {
   const to = dest ?? await freeName(dir, base(remote));
   await makeDir(dir);
-  await scpDown(machine, remote, to, true);
+  await scpDown(machine, remote, to, recursive, token);
   return to;
 }
 
@@ -707,6 +739,13 @@ export default class Files extends View {
     this.overCol = null;
     this.dragX = 0;
     this.droppedAt = 0;
+    // Ctrl/Shift selection. `picked` is the group a Download acts on; `anchor`
+    // is the row a Shift-click extends from. One download runs at a time.
+    this.picked = [];
+    this.anchor = null;
+    this.queue = [];
+    this.pumping = false;
+    this.active = null;
     // The header path doubles as an address bar: click it, type, Enter.
     this.editing = false;
     this.input = InputState.new({ placeholder: "path — Enter to go, empty Enter to cancel" });
@@ -887,7 +926,7 @@ export default class Files extends View {
       this.context = { key: next, cwd, on }; this.root = cwd; this.on = on; this.baseCwd = cwd;
       this.entries = new Map(); this.folders = new Set(saved?.folders);
       this.pending = new Set(); this.marks = {}; this.copied = null; this.copiedRow = null; this.show(null); this.watched = null; this.error = null; this.limited = false;
-      this.selected = null; this.selectedDir = null; this.status = null; this.hint = null; this.failed = false;
+      this.selected = null; this.selectedDir = null; this.picked = []; this.anchor = null; this.status = null; this.hint = null; this.failed = false;
       this.loading = false;
       if (saved?.file) this.show(saved.file, cx);
     }
@@ -960,6 +999,8 @@ export default class Files extends View {
       this.root = root;
       this.folders = new Set(); this.pending = new Set(); this.marks = {};
       this.selected = opts.expand ?? null; this.selectedDir = opts.expand ? true : null;
+      this.picked = opts.expand ? [{ path: opts.expand, dir: true }] : [];
+      this.anchor = opts.expand ?? null;
       this.entries = new Map([["", this.sorted(entries).slice(0, PER_FOLDER)]]);
       this.watched = null; this.error = null; this.status = null; this.failed = false;
       this.limited = entries.length > PER_FOLDER;
@@ -1063,48 +1104,165 @@ export default class Files extends View {
     });
   }
 
-  // Save a copy: straight into the download folder, or wherever the person picks.
-  // The bar under the header follows the destination's size, sampled on a slow beat
-  // (one `du` or PowerShell per sample, not per frame) and stopped with the copy.
-  download(path, cx, choose = false) {
-    const context = this.context, name = base(path), on = this.on;
+  // Rows in the order the tree draws them, so Shift-click and a batch download
+  // follow the screen rather than the order the clicks happened.
+  visibleItems() {
+    const out = [];
+    const walk = (prefix, depth) => {
+      if (out.length >= TOTAL || depth > 40) return;
+      for (const entry of this.entries.get(prefix) ?? []) {
+        if (out.length >= TOTAL) break;
+        const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+        out.push({ path, dir: !!entry.dir });
+        if (entry.dir && this.folders.has(path)) walk(path, depth + 1);
+      }
+    };
+    walk("", 0);
+    return out;
+  }
+
+  togglePicked(path, dir) {
+    if (!this.picked) this.picked = [];
+    const i = this.picked.findIndex((p) => p.path === path);
+    if (i >= 0) this.picked.splice(i, 1);
+    else this.picked.push({ path, dir: !!dir });
+    this.anchor = path;
+    this.selected = path;
+    this.selectedDir = !!dir;
+  }
+
+  rangePicked(path, dir) {
+    const vis = this.visibleItems();
+    const a = vis.findIndex((p) => p.path === (this.anchor ?? path));
+    const b = vis.findIndex((p) => p.path === path);
+    if (a < 0 || b < 0) this.picked = [{ path, dir: !!dir }];
+    else {
+      const lo = Math.min(a, b), hi = Math.max(a, b);
+      this.picked = vis.slice(lo, hi + 1);
+    }
+    this.anchor = this.anchor ?? path;
+    this.selected = path;
+    this.selectedDir = !!dir;
+  }
+
+  // One file, or the current selection. `choose` asks for a folder once for the batch.
+  download(path, cx, choose = false, isDir = false) {
+    this.downloadMany([{ path, dir: !!isDir }], cx, choose);
+  }
+
+  downloadMany(items, cx, choose = false) {
+    const batch = (items ?? []).filter((it) => it && it.path);
+    if (!batch.length) return;
+    const label = batch.length === 1 ? base(batch[0].path) : `${batch.length} items`;
     cx.spawn(async cx => {
-      const dir = choose ? await pickFolder({ prompt: `Download ${name} to…` }) : await saveDir();
+      const dir = choose ? await pickFolder({ prompt: `Download ${label} to…` }) : await saveDir();
       if (!dir) return;
-      const full = `${this.root}/${path}`;
-      // Copying a folder into itself would recurse forever; say so instead.
+      const root = this.root, on = this.on, context = this.context;
       if (!on) {
         const norm = (s) => String(s).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-        const src = norm(winpath(full)), dst = norm(winpath(dir));
-        if (dst === src || dst.startsWith(src + "/")) {
-          this.status = `Pick a folder outside ${name}`; cx.notify(); this.fade(cx); return;
+        const dst = norm(winpath(dir));
+        for (const it of batch) {
+          if (!it.dir) continue;
+          const src = norm(winpath(`${root}/${it.path}`));
+          if (dst === src || dst.startsWith(src + "/")) {
+            this.status = `Pick a folder outside ${base(it.path)}`;
+            cx.notify();
+            this.fade(cx);
+            return;
+          }
         }
       }
-      this.status = null; this.hint = null; this.failed = false;
-      let job = this.job = { label: `Preparing ${name}…`, unit: "bytes", done: 0, total: 0 };
-      cx.notify();
-      try {
-        // One free name, chosen here so the sampler knows exactly what to watch.
-        const saved = await freeName(dir, name);
-        const size = await bytesUnder(full, on);
-        job = this.job = { label: `Downloading ${name}`, unit: "bytes", done: 0, total: size > 0 ? size : 0 };
-        const stop = this.sampleBytes(saved, job, cx);
-        try { await (on ? pullInto(on, full, dir, saved) : copyInto(full, dir, saved)); }
-        finally { stop(); }
-        if (choose) await rememberSaveDir(dir);
-        if (this.current(context)) this.status = `Saved to ${saved}`;
-        notify({ title: "Downloaded", body: saved, level: "success", timeout: 2400 });
-        // Show where it landed — Explorer/Finder with the file selected. Not awaited:
-        // the file is saved either way, and the bar shouldn't wait on a window.
-        if (await revealWanted()) showInFileManager(saved);
-      } catch (e) {
-        if (this.current(context)) this.reportFailure("Download", e, on);
-      } finally {
-        // A second download started meanwhile owns the bar now; leave it alone.
-        if (this.job === job) this.job = null;
-        cx.notify(); this.fade(cx, this.failed ? 12000 : 4200);
+      if (choose) await rememberSaveDir(dir);
+      if (!this.queue) this.queue = [];
+      for (const it of batch) {
+        this.queue.push({ path: it.path, isDir: !!it.dir, name: base(it.path), saveDir: dir, root, on, context });
       }
+      this.status = null; this.hint = null; this.failed = false;
+      if (this.job) this.job.waiting = Math.max(0, this.queue.length - 1);
+      cx.notify();
+      this.pump(cx);
     });
+  }
+
+  // First item downloads; the rest wait. A second request only appends, so the
+  // shared chunk file is never written by two transfers at once.
+  async pump(cx) {
+    if (this.pumping) return;
+    this.pumping = true;
+    this.queueStopped = false;
+    try {
+      while (this.queue.length && !this.queueStopped) {
+        const item = this.queue[0];
+        try { await this.runOne(item, cx); }
+        catch (e) {
+          if (this.queueStopped || item.stopped) break;
+          if (this.current(item.context)) { this.reportFailure("Download", e, item.on); this.fade(cx, 12000); }
+        }
+        if (this.queue[0] === item) this.queue.shift();
+      }
+    } finally {
+      const dest = this.job?.dest, where = this.queue[0]?.saveDir;
+      if (this.queueStopped) {
+        this.queue = [];
+        this.job = null;
+        this.active = null;
+        this.queueStopped = false;
+        this.failed = false;
+        this.statusTitle = null;
+        this.status = `Stopped · partial copy left at ${dest || where || "the download folder"}`;
+        this.fade(cx, 4200);
+      } else if (!this.queue.length) {
+        if (this.job && this.active == null) this.job = null;
+      }
+      this.pumping = false;
+      cx.notify();
+    }
+  }
+
+  async runOne(item, cx) {
+    if (this.queueStopped) throw new Error("Stopped");
+    const { path, isDir, name, saveDir: dir, root, on, context } = item;
+    const full = `${root}/${path}`;
+    const waiting = () => Math.max(0, (this.queue?.length || 1) - 1);
+    const job = { label: `Preparing ${name}…`, unit: "bytes", done: 0, total: 0, waiting: waiting(), saveDir: dir };
+    this.job = job;
+    this.active = job;
+    item.stopped = false;
+    cx.notify();
+    const saved = await freeName(dir, name);
+    if (this.queueStopped || job.stopped) throw new Error("Stopped");
+    const size = await bytesUnder(full, on);
+    if (this.queueStopped || job.stopped) throw new Error("Stopped");
+    job.label = `Downloading ${name}`;
+    job.total = size > 0 ? size : 0;
+    job.dest = saved;
+    job.waiting = waiting();
+    cx.notify();
+    const stop = this.sampleBytes(saved, job, cx);
+    try {
+      await (on ? pullInto(on, full, dir, saved, job, isDir) : copyInto(full, dir, saved));
+    } finally { stop(); if (this.active === job) this.active = null; }
+    if (job.stopped || this.queueStopped) throw new Error("Stopped");
+    if (this.current(context)) { this.status = `Saved to ${saved}`; this.fade(cx); }
+    notify({ title: "Downloaded", body: saved, level: "success", timeout: 2400 });
+    if (this.queue.length === 1 && await revealWanted()) showInFileManager(saved);
+  }
+
+  // Stop ends the current transfer and drops everything still waiting.
+  stopJob(cx) {
+    const jobs = [this.job, this.active].filter(Boolean);
+    if (!jobs.length && !(this.queue?.length)) return;
+    this.queueStopped = true;
+    for (const job of jobs) {
+      if (job.stopped) continue;
+      job.stopped = true;
+      job.label = "Stopping…";
+      job.waiting = 0;
+    }
+    const dests = [...new Set(jobs.map((job) => job.dest).filter(Boolean))];
+    if (this.queue?.length) this.queue = this.active ? this.queue.slice(0, 1) : [];
+    cx.notify();
+    cx.spawn(async () => { for (const dest of dests) await killTransfer(dest); });
   }
 
   // Watch a copy in flight: every beat, ask how big the destination has grown and move
@@ -1113,7 +1271,10 @@ export default class Files extends View {
     const tick = async () => {
       if (this.job !== job) return;
       const n = await bytesUnder(dest);
-      if (this.job === job && n >= 0) { job.done = n; cx.notify(); }
+      if (this.job !== job) return;
+      job.waiting = Math.max(0, (this.queue?.length || 1) - 1);
+      if (n >= 0) job.done = n;
+      cx.notify();
     };
     const task = cx.timer.every(700, () => { tick(); });
     return () => task.cancel();
@@ -1127,12 +1288,20 @@ export default class Files extends View {
     const done = total ? Math.min(job.done, total) : job.done;
     const pct = total ? Math.min(100, (done / total) * 100) : null;
     const detail = total ? (job.unit === "items" ? `${done} of ${total}` : `${fmtBytes(done)} of ${fmtBytes(total)}`) : "";
+    const wait = job.waiting > 0 ? ` · ${job.waiting} waiting` : "";
     const fill = pct === null
       ? div().absolute().top(0).left(0).h_full().w(96).rounded_full().bg(t.ansi2)
           .loop("left", { from: -96, to: 336, period: 1400, easing: "ease-in-out" })
       : div().h_full().rounded_full().bg(t.ansi2).w(`${pct.toFixed(1)}%`).transition("width", { duration: 240, easing: "ease-out" });
+    const stop = (_e, cx) => cx.stop_propagation();
     return v_flex().flex_none().px(12).py(6).gap(5).border_b(1).border_color(t.border)
-      .child(div().text_size(11).text_color(t.dim).truncate().child(detail ? `${job.label} · ${detail}` : job.label))
+      .child(h_flex().items_center().gap(8)
+        .child(div().flex_1().min_w(0).text_size(11).text_color(t.dim).truncate().child(detail ? `${job.label}${wait} · ${detail}` : `${job.label}${wait}`))
+        .child(div().id("files-job-stop").flex_none().px(6).cursor_pointer().text_size(11).text_color(t.ansi1)
+          .hover(s => s.text_color(t.foreground))
+          .on_mouse_down("left", stop)
+          .on_click((_e, cx) => this.stopJob(cx))
+          .child("Stop")))
       .child(div().h(3).w_full().rounded_full().relative().overflow_hidden().bg(t.border).child(fill));
   }
 
@@ -1145,19 +1314,22 @@ export default class Files extends View {
     const where = into || base(root) || root;
     const total = paths.length;
     // Item by item is free to count, so uploads get a bar without sampling anything.
-    this.job = { label: `Uploading to ${where}`, unit: "items", done: 0, total };
+    const job = this.job = { label: `Uploading to ${where}`, unit: "items", done: 0, total };
     this.failed = false;
     cx.notify();
     cx.spawn(async cx => {
       const done = [];
       try {
         for (const p of paths) {
+          if (job.stopped) throw new Error("Stopped");
+          job.dest = p;
           if (on) await pushUp(on, p, remoteDir);
           else await copyInto(p, localDir);
           done.push(base(p));
-          if (this.job) this.job.done = done.length;
+          job.done = done.length;
           if (this.current(context)) cx.notify();
         }
+        if (job.stopped) throw new Error("Stopped");
         if (this.current(context)) {
           this.failed = false;
           this.status = `Uploaded ${done.length} → ${where}`;
@@ -1165,11 +1337,18 @@ export default class Files extends View {
         }
       } catch (e) {
         if (this.current(context)) {
-          this.reportFailure("Upload", e, on);
-          if (done.length) this.status = `Stopped after ${done.length} of ${total}. ${this.status}`;
+          if (job.stopped) {
+            this.failed = false;
+            this.statusTitle = null;
+            this.status = `Stopped after ${done.length} of ${total}`;
+          } else {
+            this.reportFailure("Upload", e, on);
+            if (done.length) this.status = `Stopped after ${done.length} of ${total}. ${this.status}`;
+          }
         }
       } finally {
-        this.hint = null; this.job = null;
+        this.hint = null;
+        if (this.job === job) this.job = null;
         if (this.current(context)) this.refresh(cx);
         cx.notify(); this.fade(cx);
       }
@@ -1186,11 +1365,17 @@ export default class Files extends View {
 
   // The context menu itself: a popup drawn by this same mod, one row per action.
   menuFor(path, dir, cx) {
+    const group = (this.picked ?? []).some((p) => p.path === path) && this.picked.length > 1;
+    if (!group) {
+      this.picked = [{ path, dir: !!dir }];
+      this.anchor = path;
+    }
     this.selected = path;
     this.selectedDir = dir;
+    const items = (group ? this.picked : [{ path, dir: !!dir }]).map((p) => ({ path: p.path, dir: !!p.dir }));
     openOverlay({
       mod: "files-open", kind: "popup", at: "pointer", width: 236,
-      props: { fileMenu: { path, name: base(path), dir, root: this.root, on: this.on } },
+      props: { fileMenu: { path, name: base(path), dir, root: this.root, on: this.on, items, count: items.length } },
     });
     cx.notify();
   }
@@ -1200,17 +1385,18 @@ export default class Files extends View {
     if (!m) return div();
     const item = (id, label, what) => h_flex().id(`fm-${id}`).h(30).px(9).rounded(7).items_center().cursor_pointer()
       .hover(el => el.bg(t.hover))
-      .on_click((_e, _cx) => { this.ask({ what, path: m.path, dir: m.dir, root: m.root, on: m.on }); closeOverlay(props().overlay); })
+      .on_click((_e, _cx) => { this.ask({ what, path: m.path, dir: m.dir, items: m.items, root: m.root, on: m.on }); closeOverlay(props().overlay); })
       .child(div().flex_1().min_w(0).truncate().child(label));
+    const n = m.count > 1 ? m.count : 0;
     return v_flex().id("files-menu").w_full().p(4).bg(t.popover).text_color(t.foreground).text_size(12.5)
-      .child(div().px(9).pt(3).pb(6).text_size(11).text_color(t.dim).truncate().child(m.name))
-      .when(!m.dir && !isExternal(m.path), el => el.child(item("preview", "Preview", "preview")))
-      .when(!m.dir, el => el.child(item("open", "Open with default app", "open")))
-      .when(!m.dir, el => el.child(item("openwith", platform() === "windows" ? "Open with…" : "Open in another app", "openwith")))
-      .child(item("download", m.dir ? "Download folder" : "Download", "download"))
-      .child(item("downloadto", m.dir ? "Download folder to…" : "Download to…", "downloadto"))
-      .when(m.dir, el => el.child(item("upload", "Upload files here…", "upload")))
-      .child(item("copy", "Copy path", "copy"));
+      .child(div().px(9).pt(3).pb(6).text_size(11).text_color(t.dim).truncate().child(n ? `${n} items` : m.name))
+      .when(!n && !m.dir && !isExternal(m.path), el => el.child(item("preview", "Preview", "preview")))
+      .when(!n && !m.dir, el => el.child(item("open", "Open with default app", "open")))
+      .when(!n && !m.dir, el => el.child(item("openwith", platform() === "windows" ? "Open with…" : "Open in another app", "openwith")))
+      .child(item("download", n ? `Download ${n} items` : (m.dir ? "Download folder" : "Download"), "download"))
+      .child(item("downloadto", n ? `Download ${n} items to…` : (m.dir ? "Download folder to…" : "Download to…"), "downloadto"))
+      .when(!n && m.dir, el => el.child(item("upload", "Upload files here…", "upload")))
+      .when(!n, el => el.child(item("copy", "Copy path", "copy")));
   }
 
   // A popup cannot finish an scp or a picker after it closes, and it draws in a
@@ -1226,8 +1412,8 @@ export default class Files extends View {
     if (it.what === "preview") this.show(path, cx);
     else if (it.what === "open") this.handOff(path, cx);
     else if (it.what === "openwith") this.handOff(path, cx, true);
-    else if (it.what === "download") this.download(path, cx);
-    else if (it.what === "downloadto") this.download(path, cx, true);
+    else if (it.what === "download") this.downloadMany(it.items?.length ? it.items : [{ path, dir: !!it.dir }], cx, false);
+    else if (it.what === "downloadto") this.downloadMany(it.items?.length ? it.items : [{ path, dir: !!it.dir }], cx, true);
     else if (it.what === "upload") this.startUpload(cx, path);
     else if (it.what === "copy") this.copyPath(path, cx);
     else if (it.what === "coltoggle" && COL_DEFS.includes(it.key)) this.toggleCol(it.key, cx);
@@ -1353,11 +1539,18 @@ export default class Files extends View {
       if (out.length >= TOTAL) break;
       const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[`${this.root}/${path}`];
       const external = !entry.dir && isExternal(entry.name);
-      const copied = this.copiedRow === path, chosen = this.selected === path;
+      const copied = this.copiedRow === path, chosen = (this.picked ?? []).some((p) => p.path === path);
       out.push(h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer()
         .when(chosen, el => el.bg(t.selected))
         .hover(s => s.bg(chosen ? t.selected : t.hover))
         .on_click((e, cx) => {
+          cx.stop_propagation();
+          this.pickAt = Date.now();
+          const mods = e.modifiers ?? {};
+          if (mods.shift) { this.rangePicked(path, entry.dir); cx.notify(); return; }
+          if (mods.control) { this.togglePicked(path, entry.dir); cx.notify(); return; }
+          this.picked = [{ path, dir: !!entry.dir }];
+          this.anchor = path;
           this.selected = path; this.selectedDir = entry.dir;
           // A single click on a folder opens it in place; a double click walks into
           // it — the same gesture as a file manager, and ↑ leads back out.
@@ -1481,6 +1674,10 @@ export default class Files extends View {
           .text_color(parentOf(this.root) ? t.muted : t.border).hover(s => s.text_color(t.foreground))
           .on_click((_e, cx) => this.goUp(cx)).child("↑")))
         .child(this.pathLine(t, cx))
+        .when(!this.file && (this.picked?.length > 0), el => el.child(div().id("files-download").px(4).cursor_pointer().text_size(11.5)
+          .text_color(t.accent).hover(s => s.text_color(t.foreground))
+          .on_click((_e, cx) => { cx.stop_propagation(); this.downloadMany(this.picked.map((p) => ({ path: p.path, dir: !!p.dir })), cx, false); })
+          .child(this.picked.length > 1 ? `Download ${this.picked.length}` : "Download")))
         .when(!this.file, el => el.child(div().id("files-upload").px(4).cursor_pointer().text_size(11.5)
           .text_color(t.muted).hover(s => s.text_color(t.foreground))
           .on_click((_e, cx) => this.startUpload(cx)).child("Upload")))
@@ -1495,7 +1692,14 @@ export default class Files extends View {
             .text_color(t.dim).truncate().child(this.status || this.hint)))
       .when(Boolean(this.job), el => el.child(this.jobRow(t)))
       .when(!this.file && Boolean(this.entries.get("")?.length), el => el.child(this.headerRow(t)))
-      .when(!this.file, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.rows("", 0, [], t))
+      .when(!this.file, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6)
+        .on_click((_e, cx) => {
+          if (Date.now() - (this.pickAt || 0) < 50) return;
+          if (!this.picked?.length) return;
+          this.picked = []; this.anchor = null; this.selected = null; this.selectedDir = null;
+          cx.notify();
+        })
+        .children(this.rows("", 0, [], t))
         .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().id("files-empty").p(8).text_size(12)
           .text_color(this.error ? t.ansi1 : t.dim)
           .child(this.error || (this.loading ? "Loading files…" : !this.root ? "No folder" : "This folder is empty"))))
